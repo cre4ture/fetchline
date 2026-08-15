@@ -21,7 +21,7 @@ use esp_hal::{
     main,
     time::{Duration, Instant, Rate},
 };
-use fetchline::board::{OLED_HEIGHT, OLED_I2C_ADDRESS, OLED_WIDTH};
+use fetchline::board::{OLED_CONTROLLER, OLED_HEIGHT, OLED_I2C_ADDRESS, OLED_WIDTH};
 use log::info;
 use ssd1306::{I2CDisplayInterface, Ssd1306, prelude::*};
 
@@ -49,6 +49,8 @@ fn main() -> ! {
         .with_sda(peripherals.GPIO5)
         .with_scl(peripherals.GPIO6);
 
+    // The SSD1315 uses the SSD1306-compatible command subset exercised by this
+    // driver. DisplaySize72x40 also applies the panel's 28-column RAM offset.
     let interface = I2CDisplayInterface::new_custom_address(i2c, OLED_I2C_ADDRESS);
     let mut display = Ssd1306::new(interface, DisplaySize72x40, DisplayRotation::Rotate0)
         .into_buffered_graphics_mode();
@@ -91,7 +93,9 @@ fn main() -> ! {
     .expect("failed to draw status");
     display.flush().expect("failed to update OLED");
 
-    info!("OLED initialized: {OLED_WIDTH}x{OLED_HEIGHT} at 0x{OLED_I2C_ADDRESS:02x}");
+    info!(
+        "{OLED_CONTROLLER} OLED initialized: {OLED_WIDTH}x{OLED_HEIGHT} at 0x{OLED_I2C_ADDRESS:02x}"
+    );
 
     loop {
         info!("fetchline is running");

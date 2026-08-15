@@ -13,16 +13,21 @@ monitor every five seconds.
 | --- | --- |
 | MCU | ESP32-C3 (RISC-V, 160 MHz) |
 | Flash | 4 MB |
-| OLED | SSD1306-compatible, 72 x 40 pixels |
-| OLED address | `0x3c` |
+| OLED | SSD1315 (reported), 72 x 40 pixels |
+| OLED address | `0x3c` (presumed) |
 | OLED SDA | GPIO5 |
 | OLED SCL | GPIO6 |
 | Boot button | GPIO9 |
 
-The pin assignments come from the supplied product image. The display
-controller and I²C address are the values normally used by this board family;
-if the screen stays blank, scan the I²C bus and verify the controller against
-the seller's documentation.
+The pin assignments come from the supplied product image, and the product
+overview reports an SSD1315 controller. The firmware uses the mature
+`ssd1306` Rust crate because the SSD1315 supports the command subset used here
+and that crate provides the required 72 x 40 panel geometry and column offset.
+
+The address is not stated in the supplied information. SSD1315 supports both
+`0x3c` and `0x3d`; this project starts with the address commonly used by this
+board family. If the screen stays blank, scan the I²C bus and change
+`OLED_I2C_ADDRESS` in `src/lib.rs` if necessary.
 
 ## Prerequisites
 
