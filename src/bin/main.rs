@@ -239,6 +239,10 @@ async fn main(spawner: Spawner) -> ! {
     }
 }
 
+#[allow(
+    clippy::large_stack_frames,
+    reason = "the async UART/TCP driver futures retain peripheral state across await points"
+)]
 async fn forward<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -247,17 +251,45 @@ async fn forward<R, W>(
 ) -> BridgeExit
 where
     R: Read,
+    R::Error: fmt::Debug,
     W: Write,
+    W::Error: fmt::Debug,
 {
+    let mut consecutive_read_errors = 0_u32;
+    let mut forwarding_started = false;
+
     loop {
         let count = match reader.read(buffer).await {
             Ok(0) => return BridgeExit::InputClosed(direction),
-            Ok(count) => count,
-            Err(_) => return BridgeExit::ReadError(direction),
+            Ok(count) => {
+                consecutive_read_errors = 0;
+                count
+            }
+            Err(error) if matches!(direction, CopyDirection::UartToNetwork) => {
+                consecutive_read_errors = consecutive_read_errors.saturating_add(1);
+                if consecutive_read_errors <= 3 || consecutive_read_errors.is_power_of_two() {
+                    warn!(
+                        "servo UART RX error: {error:?} (consecutive: \
+                         {consecutive_read_errors}); keeping TCP client connected"
+                    );
+                }
+                Timer::after(Duration::from_millis(10)).await;
+                continue;
+            }
+            Err(error) => {
+                warn!("{direction} read error: {error:?}");
+                return BridgeExit::ReadError(direction);
+            }
         };
 
-        if writer.write_all(&buffer[..count]).await.is_err() {
+        if let Err(error) = writer.write_all(&buffer[..count]).await {
+            warn!("{direction} write error: {error:?}");
             return BridgeExit::WriteError(direction);
+        }
+
+        if !forwarding_started {
+            info!("{direction} forwarding started with {count} bytes");
+            forwarding_started = true;
         }
     }
 }

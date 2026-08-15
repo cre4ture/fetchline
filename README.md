@@ -40,12 +40,16 @@ ESP32-C3.
 
 | ESP32-C3 board | FE-URT-2 UART header | Purpose |
 | --- | --- | --- |
-| `TX` / GPIO21 | `RXD` | Commands from Wi-Fi to the servos |
-| `RX` / GPIO20 | `TXD` | Servo replies to Wi-Fi |
+| `TX` / GPIO21 | `TXD` | Commands from Wi-Fi to the servos |
+| `RX` / GPIO20 | `RXD` | Servo replies to Wi-Fi |
 | `GND` | `GND` | Common signal reference |
+| `5V` | `5V` | FE-URT-2 logic supply only |
 
-TX and RX are crossed, exactly as in the supplied FE-URT-2 Arduino diagram.
-The adapter performs the required TTL half-duplex bus direction switching.
+Unlike a conventional UART adapter, the FE-URT-2's MCU header labels describe
+the MCU pins that connect to them. Connect TX to TX and RX to RX, exactly as in
+Feetech's Arduino diagram. The adapter performs the required TTL half-duplex bus
+direction switching. See Feetech's official
+[MCU wiring instructions](https://www.feetechrc.com/wp-content/6-how-does-single-chip-microcomputer-control-serial-port-steering-gear.html).
 
 ### Power safety
 
@@ -54,10 +58,10 @@ The adapter performs the required TTL half-duplex bus direction switching.
   5 V pin.
 - The servo supply can deliver substantial current. Set its voltage and current
   limit before attaching a servo, and start testing without a mechanical load.
-- Power the FE-URT-2 logic from either its USB-C connector or a regulated 5 V
-  source on its UART header. Do not join two independently powered 5 V outputs.
-- When the ESP board and FE-URT-2 each use their own USB cable, connect only
-  TXD, RXD, and GND between them; leave the 5 V pins disconnected.
+- In MCU mode, power the FE-URT-2 logic from the ESP board's USB 5 V pin and
+  leave the FE-URT-2 USB-C connector disconnected.
+- For a direct FE-URT-2 USB test, first disconnect the ESP board's TXD, RXD,
+  GND, and 5 V wires. Do not join two independently powered 5 V outputs.
 
 Feetech lists the FE-URT-2 as a Type-C USB-to-TTL/RS485 programmer with a UART
 header. Its supported range reaches 1 Mbps; see the
