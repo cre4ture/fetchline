@@ -10,17 +10,48 @@ name = "fetchline"
 path = "./src/bin/main.rs"
 
 [dependencies]
+embassy-executor = { version = "0.10.0", features = ["log"] }
+embassy-futures = "0.1.2"
+embassy-net = { version = "0.9.1", features = [
+  "dhcpv4",
+  "log",
+  "medium-ethernet",
+  "tcp",
+] }
+embassy-time = { version = "0.5.0", features = ["log"] }
 embedded-graphics = "0.8.2"
+embedded-io-async = "0.7.0"
+esp-alloc = "0.10.0"
 esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32c3", "log-04"] }
 esp-backtrace = { version = "0.19.0", features = [
   "esp32c3",
   "panic-handler",
   "println",
 ] }
-esp-hal = { version = "~1.1.0", features = ["esp32c3", "log-04"] }
-esp-println = { version = "0.17.0", features = ["esp32c3", "log-04"] }
+esp-hal = { version = "~1.1.0", features = ["esp32c3", "log-04", "unstable"] }
+esp-println = { version = "0.17.0", default-features = false, features = [
+  "critical-section",
+  "esp32c3",
+  "jtag-serial",
+  "log-04",
+] }
+esp-radio = { version = "0.18.0", features = [
+  "esp-alloc",
+  "esp32c3",
+  "log-04",
+  "unstable",
+  "wifi",
+] }
+esp-rtos = { version = "0.3.0", features = [
+  "embassy",
+  "esp-alloc",
+  "esp-radio",
+  "esp32c3",
+  "log-04",
+] }
 log = "0.4.27"
 ssd1306 = "0.10.0"
+static_cell = "2.1.1"
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.dev]

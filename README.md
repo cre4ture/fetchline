@@ -1,33 +1,67 @@
 # fetchline
 
-Bare-metal Rust starter project for the EGBO mini ESP32-C3 development board
-with a built-in 0.42-inch OLED.
+Bare-metal Rust firmware for the EGBO mini ESP32-C3 board with its built-in
+0.42-inch OLED. It connects a Feetech FE-URT-2 adapter to Wi-Fi, allowing
+Windows servo software to use a virtual COM port as though the STS servo bus
+were connected locally.
 
-The firmware initializes the onboard display and draws a small `FETCHLINE /
-ESP32-C3 / READY` test screen. It also writes a heartbeat to the USB serial
-monitor every five seconds.
+The bridge is transparent and binary-safe:
 
-## Board configuration
+```text
+Windows COM port <-> raw TCP port 3333 <-> ESP32-C3 UART1 <-> FE-URT-2 <-> STS servos
+```
+
+It uses DHCP, reconnects Wi-Fi automatically, accepts one TCP client at a time,
+and keeps UART1 fixed at 1,000,000 baud, 8 data bits, no parity, and 1 stop bit.
+The OLED shows startup, configuration, listening, and connected states. The
+assigned IP address is printed to the USB serial monitor.
+
+## Hardware configuration
 
 | Function | Configuration |
 | --- | --- |
-| MCU | ESP32-C3 (RISC-V, 160 MHz) |
+| MCU | ESP32-C3, RISC-V, 160 MHz |
 | Flash | 4 MB |
-| OLED | SSD1315 (reported), 72 x 40 pixels |
-| OLED address | `0x3c` (presumed) |
-| OLED SDA | GPIO5 |
-| OLED SCL | GPIO6 |
-| Boot button | GPIO9 |
+| OLED | SSD1315-compatible, 72 x 40 pixels |
+| OLED I2C | address `0x3c`, SDA GPIO5, SCL GPIO6 |
+| Servo UART | UART1, 1,000,000 baud, 8N1 |
+| Servo UART RX | GPIO20, board pin `RX` |
+| Servo UART TX | GPIO21, board pin `TX` |
+| Network endpoint | raw TCP server, port 3333 |
 
-The pin assignments come from the supplied product image, and the product
-overview reports an SSD1315 controller. The firmware uses the mature
-`ssd1306` Rust crate because the SSD1315 supports the command subset used here
-and that crate provides the required 72 x 40 panel geometry and column offset.
+The OLED address is presumed from this board family because it was not listed
+by the seller. If the screen stays blank, scan the I2C bus and try `0x3d` in
+`src/lib.rs`.
 
-The address is not stated in the supplied information. SSD1315 supports both
-`0x3c` and `0x3d`; this project starts with the address commonly used by this
-board family. If the screen stays blank, scan the I²C bus and change
-`OLED_I2C_ADDRESS` in `src/lib.rs` if necessary.
+## FE-URT-2 wiring
+
+Set the FE-URT-2 TTL level selector to **3.3 V** before connecting it to the
+ESP32-C3.
+
+| ESP32-C3 board | FE-URT-2 UART header | Purpose |
+| --- | --- | --- |
+| `TX` / GPIO21 | `RXD` | Commands from Wi-Fi to the servos |
+| `RX` / GPIO20 | `TXD` | Servo replies to Wi-Fi |
+| `GND` | `GND` | Common signal reference |
+
+TX and RX are crossed, exactly as in the supplied FE-URT-2 Arduino diagram.
+The adapter performs the required TTL half-duplex bus direction switching.
+
+### Power safety
+
+- Power the servos through the FE-URT-2 screw terminals with a supply suitable
+  for the exact servo model. Do **not** power servos from the ESP32-C3 3.3 V or
+  5 V pin.
+- The servo supply can deliver substantial current. Set its voltage and current
+  limit before attaching a servo, and start testing without a mechanical load.
+- Power the FE-URT-2 logic from either its USB-C connector or a regulated 5 V
+  source on its UART header. Do not join two independently powered 5 V outputs.
+- When the ESP board and FE-URT-2 each use their own USB cable, connect only
+  TXD, RXD, and GND between them; leave the 5 V pins disconnected.
+
+Feetech lists the FE-URT-2 as a Type-C USB-to-TTL/RS485 programmer with a UART
+header. Its supported range reaches 1 Mbps; see the
+[official Feetech debugging-board listing](https://www.feetechrc.com/serial-port-series-steering-gear_50681).
 
 ## Prerequisites
 
@@ -38,39 +72,85 @@ flashing tool:
 cargo install espflash --locked
 ```
 
-The checked-in `rust-toolchain.toml` installs the stable compiler, `rust-src`,
-and the `riscv32imc-unknown-none-elf` target automatically.
+The checked-in toolchain configuration installs the stable compiler, `rust-src`,
+and the `riscv32imc-unknown-none-elf` target. On Linux, the user running
+`espflash` must have access to the board's serial device.
 
-On Linux, your user must have permission to access the board's serial device.
-Depending on the distribution, that can require membership in the `dialout` or
-`uucp` group, or an appropriate udev rule.
+## Configure, build, and flash
 
-## Build and flash
-
-Connect the board through its USB-C data port, then run:
+Wi-Fi credentials are compile-time environment variables and are embedded in
+the firmware image. They are not stored in this repository.
 
 ```sh
+WIFI_SSID='your-2.4-GHz-network' \
+WIFI_PASSWORD='your-password' \
 cargo run --release
 ```
 
-The Cargo runner flashes the ESP32-C3 and opens a serial monitor. If automatic
-download mode does not work, hold **BOOT**, tap **RST**, release **BOOT**, and
-run the command again.
+ESP32-C3 supports 2.4 GHz Wi-Fi, not a 5 GHz-only network. If automatic download
+mode fails, hold **BOOT**, tap **RST**, release **BOOT**, and run the command
+again. Building without credentials succeeds, but that firmware stops at the
+`WIFI CONFIG / SET BUILD / VARIABLES` screen.
 
-Build without touching hardware with:
+After DHCP completes, the USB log contains a line similar to:
 
-```sh
-cargo build --release
+```text
+Wi-Fi ready: IP 192.168.1.123/24, raw TCP port 3333
 ```
 
-## Next steps
+Reserve that address for the board in the router's DHCP settings so the Windows
+virtual-COM configuration remains stable.
 
-The starter deliberately does not enable Wi-Fi or Bluetooth. Add those through
-the `esp-radio` ecosystem when the application needs them; this keeps the
-initial firmware and dependency set small.
+## Windows virtual COM port
+
+[HW VSP3 Single](https://www.hw-group.com/software/hw-vsp3-virtual-serial-port)
+is one Windows virtual serial port driver that can redirect a COM port to an
+IP address and TCP port. Install it as an administrator, then:
+
+1. Check connectivity in PowerShell:
+
+   ```powershell
+   Test-NetConnection 192.168.1.123 -Port 3333
+   ```
+
+2. Open **Virtual Serial Port** in HW VSP3 and choose an unused port such as
+   `COM9`.
+3. Enter the ESP32-C3's DHCP address and port `3333`.
+4. Use normal client mode, turn off **TCP server mode**, and click **Create COM**.
+5. Leave **NVT**, **NVT filter**, and **NVT port setup** disabled. Fetchline uses
+   transparent raw TCP, not Telnet or RFC 2217 control sequences.
+6. In the Feetech application, open that COM port at **1,000,000 baud, 8N1**.
+
+The firmware's UART parameters are fixed; changing the baud rate in Windows
+does not reconfigure the remote UART. A detailed example of creating a COM port
+from an IP address and port is available in the
+[Teltonika HW VSP3 guide](https://wiki.teltonika-networks.com/view/Connect_Serial_Devices_as_Virtual_COM_Ports_using_TRB145_and_HW_VSP3).
+
+Only one Windows application can open a COM port, and fetchline accepts only one
+TCP client. Close Feetech tools, terminals, or previous VSP connections that may
+already own it before troubleshooting a connection.
+
+## Security
+
+Port 3333 has no authentication or encryption. Every byte received is sent to
+physical actuators. Use this firmware only on a trusted private LAN or through a
+VPN. Never expose or port-forward TCP 3333 to the public internet.
+
+## Development checks
+
+```sh
+cargo fmt --all --check
+WIFI_SSID='compile-test' WIFI_PASSWORD='compile-test-password' cargo build --release
+WIFI_SSID='compile-test' WIFI_PASSWORD='compile-test-password' \
+  cargo clippy --workspace --all-features -- -D warnings
+```
 
 Useful references:
 
 - [Rust on ESP Book](https://docs.espressif.com/projects/rust/book/)
 - [`esp-hal` documentation for ESP32-C3](https://docs.espressif.com/projects/rust/esp-hal/latest/esp32c3/esp_hal/)
-- [`ssd1306` driver documentation](https://docs.rs/ssd1306/0.10.0/ssd1306/)
+- [Feetech Arduino servo library](https://github.com/ftservo/FTServo_Arduino)
+
+## License
+
+Licensed under the [MIT License](LICENSE).
