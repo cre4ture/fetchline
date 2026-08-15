@@ -42,6 +42,7 @@ use ssd1306::{I2CDisplayInterface, Ssd1306, prelude::*};
 
 extern crate alloc;
 
+use alloc::format;
 use core::fmt;
 
 // These values are compiled into the firmware. build.rs tracks both variables,
@@ -192,9 +193,9 @@ async fn main(spawner: Spawner) -> ! {
                 "Wi-Fi ready: IP {}, raw TCP port {BRIDGE_TCP_PORT}",
                 config.address
             );
+            show_ip_address(&mut display, config.address.address());
+            display.flush().expect("failed to update OLED");
         }
-        show_status(&mut display, ["WIFI UART", "ONLINE", "TCP 3333"]);
-        display.flush().expect("failed to update OLED");
 
         let mut socket = TcpSocket::new(stack, &mut tcp_rx_buffer, &mut tcp_tx_buffer);
         socket.set_nagle_enabled(false);
@@ -209,8 +210,6 @@ async fn main(spawner: Spawner) -> ! {
         }
 
         info!("TCP client connected: {:?}", socket.remote_endpoint());
-        show_status(&mut display, ["VIRTUAL COM", "CONNECTED", "1 MBAUD"]);
-        display.flush().expect("failed to update OLED");
 
         let result = {
             let (mut tcp_rx, mut tcp_tx) = socket.split();
@@ -292,6 +291,20 @@ where
             forwarding_started = true;
         }
     }
+}
+
+fn show_ip_address<D>(display: &mut D, address: core::net::Ipv4Addr)
+where
+    D: DrawTarget<Color = BinaryColor>,
+{
+    let [first, second, third, fourth] = address.octets();
+    let first_line = format!("{first}.{second}.");
+    let second_line = format!("{third}.{fourth}");
+
+    show_status(
+        display,
+        ["IP ADDRESS", first_line.as_str(), second_line.as_str()],
+    );
 }
 
 fn show_status<D>(display: &mut D, lines: [&str; 3])

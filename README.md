@@ -13,8 +13,10 @@ Windows COM port <-> raw TCP port 3333 <-> ESP32-C3 UART1 <-> FE-URT-2 <-> STS s
 
 It uses DHCP, reconnects Wi-Fi automatically, accepts one TCP client at a time,
 and keeps UART1 fixed at 1,000,000 baud, 8 data bits, no parity, and 1 stop bit.
-The OLED shows startup, configuration, listening, and connected states. The
-assigned IP address is printed to the USB serial monitor.
+After DHCP completes, the OLED shows the assigned IPv4 address across two lines
+and keeps it visible while clients connect and disconnect. Startup or
+configuration diagnostics are shown only until an address is available. The
+assigned address is also printed to the USB serial monitor.
 
 ## Hardware configuration
 
