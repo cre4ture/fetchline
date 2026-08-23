@@ -1,4 +1,3 @@
-const STORAGE_KEY = "fetchline-servo-control-v1";
 const POSITION_MIN = 0;
 const POSITION_MAX = 4095;
 const CONTROL_INTERVAL_MS = 45;
@@ -14,37 +13,42 @@ const defaults = {
   })),
 };
 
-let config = loadConfig();
+let config = structuredClone(defaults);
 let socket;
 let connectedToMcu = false;
 const currentPositions = new Map();
 const queuedMoves = new Map();
 
-function loadConfig() {
+async function loadConfig() {
   try {
-    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY));
-    if (!stored) return structuredClone(defaults);
-    return {
-      endpoint: {
-        host: typeof stored.endpoint?.host === "string" ? stored.endpoint.host : defaults.endpoint.host,
-        port: clampNumber(stored.endpoint?.port, 1, 65535, defaults.endpoint.port),
-      },
-      motor: {
-        id: clampNumber(stored.motor?.id, 1, 253, defaults.motor.id),
-        enabled: stored.motor?.enabled !== false,
-        speedPercent: clampNumber(stored.motor?.speedPercent, 0, 100, defaults.motor.speedPercent),
-        acceleration: clampNumber(stored.motor?.acceleration, 0, 254, defaults.motor.acceleration),
-      },
-      joints: Array.from({ length: 6 }, (_, index) => ({
-        id: clampNumber(stored.joints?.[index]?.id, 1, 253, index + 2),
-        enabled: stored.joints?.[index]?.enabled !== false,
-        acceleration: clampNumber(stored.joints?.[index]?.acceleration, 0, 254, 20),
-        torquePercent: clampNumber(stored.joints?.[index]?.torquePercent, 0, 100, 100),
-      })),
-    };
-  } catch {
+    const response = await fetch("/config", { cache: "no-store" });
+    if (!response.ok) throw new Error(`configuration request failed: ${response.status}`);
+    return normalizeConfig(await response.json());
+  } catch (error) {
+    console.warn("Could not load the host configuration", error);
     return structuredClone(defaults);
   }
+}
+
+function normalizeConfig(stored) {
+  return {
+    endpoint: {
+      host: typeof stored.endpoint?.host === "string" ? stored.endpoint.host : defaults.endpoint.host,
+      port: clampNumber(stored.endpoint?.port, 1, 65535, defaults.endpoint.port),
+    },
+    motor: {
+      id: clampNumber(stored.motor?.id, 1, 253, defaults.motor.id),
+      enabled: stored.motor?.enabled !== false,
+      speedPercent: clampNumber(stored.motor?.speedPercent, 0, 100, defaults.motor.speedPercent),
+      acceleration: clampNumber(stored.motor?.acceleration, 0, 254, defaults.motor.acceleration),
+    },
+    joints: Array.from({ length: 6 }, (_, index) => ({
+      id: clampNumber(stored.joints?.[index]?.id, 1, 253, index + 2),
+      enabled: stored.joints?.[index]?.enabled !== false,
+      acceleration: clampNumber(stored.joints?.[index]?.acceleration, 0, 254, 20),
+      torquePercent: clampNumber(stored.joints?.[index]?.torquePercent, 0, 100),
+    })),
+  };
 }
 
 function clampNumber(value, minimum, maximum, fallback) {
@@ -53,7 +57,14 @@ function clampNumber(value, minimum, maximum, fallback) {
 }
 
 function saveConfig() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(config));
+  const snapshot = JSON.stringify(config);
+  void fetch("/config", {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: snapshot,
+  }).then((response) => {
+    if (!response.ok) throw new Error(`configuration update failed: ${response.status}`);
+  }).catch((error) => setStatus(`Could not save host configuration: ${error.message}`, "error"));
 }
 
 function setStatus(text, kind = "") {
@@ -295,7 +306,8 @@ function updatePosition(id, position) {
   if (slider && position >= POSITION_MIN && position <= POSITION_MAX) slider.value = position;
 }
 
-document.addEventListener("DOMContentLoaded", () => {
+document.addEventListener("DOMContentLoaded", async () => {
+  config = await loadConfig();
   render();
   document.querySelector("#connection-form").addEventListener("submit", (event) => {
     event.preventDefault();

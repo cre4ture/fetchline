@@ -16,7 +16,7 @@ firmware-flash:
 
 # Start the LAN-accessible web control panel. Pass another address if needed.
 host address="0.0.0.0:8787":
-    cargo run --manifest-path host/Cargo.toml --target "{{host_target}}" --release -- "{{address}}"
+    cargo run --manifest-path host/Cargo.toml --target "{{host_target}}" --release --bin fetchline-host -- "{{address}}"
 
 # Store Wi-Fi credentials in the reserved flash sector over USB.
 provision-wifi port="/dev/ttyACM0":
