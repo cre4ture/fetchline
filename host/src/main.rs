@@ -267,6 +267,20 @@ async fn connect(state: &AppState, host: String, port: u16) -> ServerMessage {
     }
 
     let peer = format!("{host}:{port}");
+    // The ESP32 bridge accepts one TCP client. Reuse an existing connection to
+    // the same MCU instead of attempting a second connection, which the MCU
+    // correctly refuses while the first one is active.
+    let mut bridge = state.bridge.lock().await;
+    if bridge
+        .as_ref()
+        .is_some_and(|connection| connection.peer == peer)
+    {
+        return ServerMessage::Connected { address: peer };
+    }
+
+    // Switching targets deliberately closes the previous client before opening
+    // the new one, so the prior one-client MCU can accept the new connection.
+    *bridge = None;
     match timeout(SERVO_TIMEOUT, TcpStream::connect(&peer)).await {
         Ok(Ok(stream)) => {
             if let Err(error) = stream.set_nodelay(true) {
@@ -275,7 +289,6 @@ async fn connect(state: &AppState, host: String, port: u16) -> ServerMessage {
                     bridge_connected: false,
                 };
             }
-            let mut bridge = state.bridge.lock().await;
             *bridge = Some(BridgeConnection {
                 peer: peer.clone(),
                 stream,
@@ -693,6 +706,32 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(errors[0].starts_with("Servo 3: Timed out"));
         servo.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnecting_to_the_same_mcu_reuses_its_single_tcp_client() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = AppState::default();
+
+        assert!(matches!(
+            connect(&state, "127.0.0.1".to_owned(), port).await,
+            ServerMessage::Connected { .. }
+        ));
+        let (_stream, _) = timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .expect("first connection should reach the MCU")
+            .unwrap();
+
+        assert!(matches!(
+            connect(&state, "127.0.0.1".to_owned(), port).await,
+            ServerMessage::Connected { .. }
+        ));
+        assert!(
+            timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     async fn receive_packet(stream: &mut TcpStream) -> Vec<u8> {
