@@ -48,14 +48,12 @@ use core::fmt;
 const TCP_BUFFER_SIZE: usize = 4096;
 const COPY_BUFFER_SIZE: usize = 512;
 const WIFI_CONFIG_FLASH_OFFSET: usize = 0x003f_0000;
-// ESP32-C3 maps flash separately for instructions (IROM at 0x4200_0000) and
-// data (DROM at 0x3c00_0000). Credential bytes are read as data.
-const FLASH_MMAP_BASE: usize = 0x3c00_0000;
 const WIFI_CONFIG_MAGIC: [u8; 4] = *b"FLWC";
 const WIFI_CONFIG_VERSION: u8 = 1;
-const WIFI_CONFIG_HEADER_SIZE: usize = 12;
 const WIFI_SSID_MAX_LEN: usize = 32;
 const WIFI_PASSWORD_MAX_LEN: usize = 63;
+// The ROM reader requires a four-byte aligned length.
+const WIFI_CONFIG_READ_SIZE: usize = 108;
 
 struct WifiCredentials {
     ssid: [u8; WIFI_SSID_MAX_LEN],
@@ -375,12 +373,20 @@ fn load_wifi_credentials() -> Option<WifiCredentials> {
     // The 4 MB flash has a dedicated 64 KB configuration area at its end. The
     // application image lives at the low end of flash, so normal `espflash
     // flash` updates leave this area untouched.
-    let bytes = unsafe {
-        core::slice::from_raw_parts(
-            (FLASH_MMAP_BASE + WIFI_CONFIG_FLASH_OFFSET) as *const u8,
-            WIFI_CONFIG_HEADER_SIZE + WIFI_SSID_MAX_LEN + WIFI_PASSWORD_MAX_LEN,
+    // The application partition is the only flash range mapped into DROM at
+    // startup. This record sits after that partition, so read it through the
+    // ESP ROM instead of dereferencing a mapped address.
+    let mut bytes = [0_u8; WIFI_CONFIG_READ_SIZE];
+    let result = unsafe {
+        esp_rom_sys::rom::spiflash::esp_rom_spiflash_read(
+            WIFI_CONFIG_FLASH_OFFSET as u32,
+            bytes.as_mut_ptr().cast(),
+            WIFI_CONFIG_READ_SIZE as u32,
         )
     };
+    if result != esp_rom_sys::rom::spiflash::ESP_ROM_SPIFLASH_RESULT_OK {
+        return None;
+    }
     if bytes[..4] != WIFI_CONFIG_MAGIC || bytes[4] != WIFI_CONFIG_VERSION {
         return None;
     }
