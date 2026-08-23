@@ -48,7 +48,9 @@ use core::fmt;
 const TCP_BUFFER_SIZE: usize = 4096;
 const COPY_BUFFER_SIZE: usize = 512;
 const WIFI_CONFIG_FLASH_OFFSET: usize = 0x003f_0000;
-const FLASH_MMAP_BASE: usize = 0x4200_0000;
+// ESP32-C3 maps flash separately for instructions (IROM at 0x4200_0000) and
+// data (DROM at 0x3c00_0000). Credential bytes are read as data.
+const FLASH_MMAP_BASE: usize = 0x3c00_0000;
 const WIFI_CONFIG_MAGIC: [u8; 4] = *b"FLWC";
 const WIFI_CONFIG_VERSION: u8 = 1;
 const WIFI_CONFIG_HEADER_SIZE: usize = 12;
