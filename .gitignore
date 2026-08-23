@@ -24,3 +24,7 @@ target/
 
 # Ignore .DS_Store file in mac
 **/.DS_Store
+
+# Host-state fallbacks used only when the XDG and HOME environment variables are absent.
+fetchline-host-config.json
+fetchline-host.log*
