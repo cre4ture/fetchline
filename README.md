@@ -11,6 +11,45 @@ The bridge is transparent and binary-safe:
 Windows COM port <-> raw TCP port 3333 <-> ESP32-C3 UART1 <-> FE-URT-2 <-> STS servos
 ```
 
+## Linux host control panel
+
+The `host/` directory contains a Linux PC application with a browser UI for
+direct manual control. It owns the one raw-TCP connection to the MCU and serves
+the UI on the local machine, so no browser extension and no virtual COM driver
+is required.
+
+It controls Feetech **STS/SMS-compatible** servos with the normal STS protocol:
+
+- Servo 1 is a continuous motor control: clockwise, counter-clockwise, and
+  stop. Its maximum speed (percentage of the STS raw range) and acceleration
+  profile are configurable. Starting it selects the servo's continuous mode,
+  which is a persistent setting in the servo.
+- Servos 2–7 each have configurable IDs, live position sliders, maximum
+  acceleration, and holding torque limit. Current positions are read when the
+  MCU connects and when **Update positions** is pressed.
+- The MCU address, IDs, and all control limits are saved in that browser's
+  `localStorage` and restore after a page reload. Nothing is saved remotely.
+
+Run it on the Linux PC with a recent stable Rust toolchain:
+
+```sh
+HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+cargo run --manifest-path host/Cargo.toml --target "$HOST_TARGET" --release
+```
+
+Then open [http://127.0.0.1:8787](http://127.0.0.1:8787) and enter the IP
+address shown on the MCU OLED. An alternative local listen address can be given
+as the first argument, for example:
+
+```sh
+HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+cargo run --manifest-path host/Cargo.toml --target "$HOST_TARGET" --release -- 127.0.0.1:9000
+```
+
+Only one program may use the MCU TCP bridge. Close the virtual COM software and
+any other `fetchline-host` page before connecting this panel. The host binds to
+loopback by default, deliberately keeping servo control off the network.
+
 It uses DHCP, reconnects Wi-Fi automatically, accepts one TCP client at a time,
 and keeps UART1 fixed at 1,000,000 baud, 8 data bits, no parity, and 1 stop bit.
 After DHCP completes, the OLED shows the assigned IPv4 address across two lines

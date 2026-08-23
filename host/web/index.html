@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#102820">
+    <title>Fetchline Servo Control</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script defer src="/app.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <p class="eyebrow">FETCHLINE / LOCAL CONTROL</p>
+        <h1>STS Servo Control</h1>
+        <p class="lede">Control the servos exposed by your Wi-Fi UART bridge. Settings are kept only in this browser.</p>
+      </header>
+
+      <section class="connection card" aria-labelledby="connection-title">
+        <div class="card-heading">
+          <div>
+            <p class="eyebrow">CONNECTION</p>
+            <h2 id="connection-title">MCU bridge</h2>
+          </div>
+          <p id="connection-status" class="status" role="status">Connecting to local host…</p>
+        </div>
+        <form id="connection-form" class="endpoint-form">
+          <label>MCU IP or host name
+            <input id="mcu-host" name="host" inputmode="url" autocomplete="off" required>
+          </label>
+          <label>TCP port
+            <input id="mcu-port" name="port" type="number" min="1" max="65535" required>
+          </label>
+          <button type="submit">Connect &amp; read positions</button>
+        </form>
+        <p class="hint">The host application is the only TCP client of the MCU. Close virtual-COM software while this panel is in use.</p>
+      </section>
+
+      <section id="motor-panel" class="card" aria-labelledby="motor-title"></section>
+
+      <section class="section-heading">
+        <div>
+          <p class="eyebrow">SERVOS 2–7</p>
+          <h2>Position controls</h2>
+        </div>
+        <button id="refresh-positions" class="quiet" type="button">Update positions</button>
+      </section>
+      <p class="hint position-hint">Positions are read after a successful connection and when updated here. Moving a slider sends position commands live.</p>
+      <section id="position-panels" class="position-grid" aria-live="polite"></section>
+    </main>
+  </body>
+</html>
