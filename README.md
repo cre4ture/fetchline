@@ -49,6 +49,33 @@ the first argument, for example:
 just host 127.0.0.1:9000
 ```
 
+## Host diagnostics
+
+The host app writes diagnostics to
+`~/.local/state/fetchline-host/fetchline-host.log` (or
+`$XDG_STATE_HOME/fetchline-host/fetchline-host.log`). Its current log plus up
+to three numbered archives are retained, each up to 5 MiB. View the latest
+entries with:
+
+```sh
+just host-logs
+```
+
+The normal log records host startup, browser WebSocket connect/disconnect,
+MCU TCP connection attempts and failures, and every servo action with its
+elapsed time. Individual servo timeouts, corrupt replies, and servo-reported
+STS errors are logged with the servo ID while retaining the MCU TCP connection
+when possible. For individual STS packet metadata, start the panel with:
+
+```sh
+just host-debug
+```
+
+Packet payloads are intentionally not logged. This avoids filling the log
+during live slider movement while retaining the IDs, instructions, errors, and
+timing needed to distinguish a host/MCU network failure from a servo-bus
+failure.
+
 Only one program may use the MCU TCP bridge. Close the virtual COM software and
 any other `fetchline-host` page before connecting this panel. The host has no
 authentication: every device that can reach its port can command physical

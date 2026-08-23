@@ -6,15 +6,17 @@
 
 use std::{
     env, fs,
+    io::Write,
+    net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, Mutex as StdMutex, OnceLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     Router,
     extract::{
-        State, WebSocketUpgrade,
+        ConnectInfo, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderValue, StatusCode, header},
@@ -41,12 +43,69 @@ const STS_TORQUE_ENABLE: u8 = 40;
 const STS_ACCELERATION: u8 = 41;
 const STS_TORQUE_LIMIT: u8 = 48;
 const STS_PRESENT_POSITION: u8 = 56;
+const MAX_LOG_FILE_BYTES: u64 = 5 * 1024 * 1024;
+const LOG_HISTORY_FILES: u8 = 3;
+
+static LOGGER: OnceLock<FileLogger> = OnceLock::new();
+
+struct FileLogger {
+    file: StdMutex<fs::File>,
+    path: PathBuf,
+}
+
+impl log::Log for FileLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| format!("{}.{:03}", duration.as_secs(), duration.subsec_millis()))
+            .unwrap_or_else(|_| "before-unix-epoch".to_owned());
+        let line = format!("{timestamp} {:<5} {}", record.level(), record.args());
+        eprintln!("{line}");
+
+        let Ok(mut file) = self.file.lock() else {
+            return;
+        };
+        if file
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() >= MAX_LOG_FILE_BYTES)
+            && let Ok(replacement) = rotate_log_file(&self.path)
+        {
+            *file = replacement;
+        }
+        let _ = writeln!(file, "{line}");
+        let _ = file.flush();
+    }
+
+    fn flush(&self) {
+        if let Ok(mut file) = self.file.lock() {
+            let _ = file.flush();
+        }
+    }
+}
 
 #[derive(Clone)]
 struct AppState {
     bridge: Arc<Mutex<Option<BridgeConnection>>>,
     config: Arc<Mutex<HostConfig>>,
     config_path: Arc<PathBuf>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            bridge: Arc::new(Mutex::new(None)),
+            config: Arc::new(Mutex::new(HostConfig::default())),
+            config_path: Arc::new(PathBuf::from("fetchline-host-config.json")),
+        }
+    }
 }
 
 struct BridgeConnection {
@@ -140,6 +199,33 @@ enum ClientMessage {
     },
 }
 
+impl ClientMessage {
+    fn summary(&self) -> String {
+        match self {
+            Self::Connect { host, port } => format!("connect MCU {host}:{port}"),
+            Self::StartMotor {
+                id,
+                speed,
+                acceleration,
+                direction,
+            } => format!(
+                "start motor servo={id} direction={direction:?} speed={speed} acceleration={acceleration}"
+            ),
+            Self::StopMotor { id } => format!("stop motor servo={id}"),
+            Self::MovePosition {
+                id,
+                position,
+                acceleration,
+                torque_limit,
+            } => format!(
+                "move servo={id} position={position} acceleration={acceleration} torque_limit={torque_limit}"
+            ),
+            Self::ReadPosition { id } => format!("read position servo={id}"),
+            Self::ReadPositions { ids } => format!("read positions servos={ids:?}"),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Direction {
@@ -178,19 +264,26 @@ struct Position {
 
 #[tokio::main]
 async fn main() {
+    let log_path = host_log_path();
+    initialize_logging(&log_path).unwrap_or_else(|error| panic!("could not start logging: {error}"));
+    log::info!("fetchline host starting; log file={}", log_path.display());
+
     let listen_address = env::args()
         .nth(1)
         .unwrap_or_else(|| DEFAULT_LISTEN_ADDRESS.to_owned());
-    let listener = TcpListener::bind(&listen_address)
-        .await
-        .unwrap_or_else(|error| panic!("could not bind {listen_address}: {error}"));
+    let listener = match TcpListener::bind(&listen_address).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            log::error!("could not bind HTTP listener {listen_address}: {error}");
+            panic!("could not bind {listen_address}: {error}");
+        }
+    };
 
-    println!("Fetchline host UI listening on http://{listen_address}");
-    println!("Open http://<LAN-IP-of-this-PC>:8787 from a device on the local network.");
+    log::info!("HTTP control panel listening on http://{listen_address}");
 
     let config_path = host_config_path();
     let config = load_host_config(&config_path);
-    println!("Host configuration: {}", config_path.display());
+    log::info!("host configuration file={}", config_path.display());
     let state = AppState {
         bridge: Arc::new(Mutex::new(None)),
         config: Arc::new(Mutex::new(config)),
@@ -205,9 +298,82 @@ async fn main() {
         .route("/ws", get(websocket))
         .with_state(state);
 
-    axum::serve(listener, app)
-        .await
-        .expect("local web server stopped unexpectedly");
+    if let Err(error) = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await {
+        log::error!("HTTP server stopped unexpectedly: {error}");
+    }
+}
+
+fn host_log_path() -> PathBuf {
+    if let Some(path) = env::var_os("XDG_STATE_HOME").filter(|path| !path.is_empty()) {
+        return PathBuf::from(path).join("fetchline-host/fetchline-host.log");
+    }
+    if let Some(home) = env::var_os("HOME").filter(|path| !path.is_empty()) {
+        return PathBuf::from(home).join(".local/state/fetchline-host/fetchline-host.log");
+    }
+    PathBuf::from("fetchline-host.log")
+}
+
+fn initialize_logging(path: &Path) -> Result<(), String> {
+    let parent = path.parent().ok_or("log path has no parent directory")?;
+    fs::create_dir_all(parent).map_err(|error| format!("could not create log directory: {error}"))?;
+    let file = open_log_file(path)?;
+    LOGGER
+        .set(FileLogger {
+            file: StdMutex::new(file),
+            path: path.to_owned(),
+        })
+        .map_err(|_| "logger was already initialized".to_owned())?;
+    log::set_logger(LOGGER.get().expect("logger was initialized"))
+        .map_err(|error| format!("could not register logger: {error}"))?;
+    log::set_max_level(log_level_from_environment());
+    Ok(())
+}
+
+fn log_level_from_environment() -> log::LevelFilter {
+    match env::var("FETCHLINE_LOG").as_deref() {
+        Ok("debug") => log::LevelFilter::Debug,
+        Ok("trace") => log::LevelFilter::Trace,
+        Ok("warn") => log::LevelFilter::Warn,
+        Ok("error") => log::LevelFilter::Error,
+        _ => log::LevelFilter::Info,
+    }
+}
+
+fn open_log_file(path: &Path) -> Result<fs::File, String> {
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("could not open log file {}: {error}", path.display()))
+}
+
+fn rotate_log_file(path: &Path) -> Result<fs::File, String> {
+    for index in (1..LOG_HISTORY_FILES).rev() {
+        let previous = log_archive_path(path, index);
+        let next = log_archive_path(path, index + 1);
+        if previous.exists() {
+            fs::rename(&previous, &next).map_err(|error| {
+                format!(
+                    "could not rotate log {} to {}: {error}",
+                    previous.display(),
+                    next.display()
+                )
+            })?;
+        }
+    }
+    let first_archive = log_archive_path(path, 1);
+    fs::rename(path, &first_archive).map_err(|error| {
+        format!(
+            "could not rotate log {} to {}: {error}",
+            path.display(),
+            first_archive.display()
+        )
+    })?;
+    open_log_file(path)
+}
+
+fn log_archive_path(path: &Path, index: u8) -> PathBuf {
+    path.with_extension(format!("log.{index}"))
 }
 
 fn host_config_path() -> PathBuf {
@@ -226,18 +392,18 @@ fn load_host_config(path: &Path) -> HostConfig {
             Ok(config) => match validate_host_config(&config) {
                 Ok(()) => config,
                 Err(error) => {
-                    eprintln!("ignoring invalid host configuration {}: {error}", path.display());
+                    log::warn!("ignoring invalid host configuration {}: {error}", path.display());
                     HostConfig::default()
                 }
             },
             Err(error) => {
-                eprintln!("ignoring invalid host configuration {}: {error}", path.display());
+                log::warn!("ignoring invalid host configuration {}: {error}", path.display());
                 HostConfig::default()
             }
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => HostConfig::default(),
         Err(error) => {
-            eprintln!("could not read host configuration {}: {error}", path.display());
+            log::error!("could not read host configuration {}: {error}", path.display());
             HostConfig::default()
         }
     }
@@ -288,10 +454,16 @@ async fn put_config(
     Json(mut config): Json<HostConfig>,
 ) -> Result<Json<HostConfig>, (StatusCode, String)> {
     config.endpoint.host = config.endpoint.host.trim().to_owned();
-    validate_host_config(&config).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    persist_host_config(&state.config_path, &config)
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    if let Err(error) = validate_host_config(&config) {
+        log::warn!("rejected invalid host configuration update: {error}");
+        return Err((StatusCode::BAD_REQUEST, error));
+    }
+    if let Err(error) = persist_host_config(&state.config_path, &config) {
+        log::error!("could not persist host configuration: {error}");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, error));
+    }
     *state.config.lock().await = config.clone();
+    log::info!("host configuration updated for MCU {}:{}", config.endpoint.host, config.endpoint.port);
     Ok(Json(config))
 }
 
@@ -318,37 +490,54 @@ fn asset(content_type: &'static str, body: &'static str) -> Response {
         .into_response()
 }
 
-async fn websocket(websocket: WebSocketUpgrade, State(state): State<AppState>) -> Response {
-    websocket.on_upgrade(move |socket| client_session(socket, state))
+async fn websocket(
+    websocket: WebSocketUpgrade,
+    ConnectInfo(browser_peer): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+) -> Response {
+    websocket.on_upgrade(move |socket| {
+        log::info!("browser WebSocket connected peer={browser_peer}");
+        client_session(socket, state, browser_peer)
+    })
 }
 
-async fn client_session(mut socket: WebSocket, state: AppState) {
+async fn client_session(mut socket: WebSocket, state: AppState, browser_peer: SocketAddr) {
     while let Some(message) = socket.recv().await {
         let response = match message {
             Ok(Message::Text(text)) => match serde_json::from_str(&text) {
                 Ok(request) => handle_request(&state, request).await,
-                Err(error) => ServerMessage::Error {
-                    message: format!("Invalid control request: {error}"),
-                    bridge_connected: false,
-                },
+                Err(error) => {
+                    log::warn!("browser sent invalid control request peer={browser_peer}: {error}");
+                    ServerMessage::Error {
+                        message: format!("Invalid control request: {error}"),
+                        bridge_connected: false,
+                    }
+                }
             },
-            Ok(Message::Close(_)) => break,
+            Ok(Message::Close(_)) => {
+                log::info!("browser WebSocket closed peer={browser_peer}");
+                break;
+            }
             Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
-            Ok(Message::Binary(_)) => ServerMessage::Error {
-                message: "Binary WebSocket messages are not supported".to_owned(),
-                bridge_connected: false,
-            },
+            Ok(Message::Binary(_)) => {
+                log::warn!("browser sent unsupported binary WebSocket message peer={browser_peer}");
+                ServerMessage::Error {
+                    message: "Binary WebSocket messages are not supported".to_owned(),
+                    bridge_connected: false,
+                }
+            }
             Err(error) => {
-                eprintln!("browser connection closed: {error}");
+                log::warn!("browser WebSocket connection failed peer={browser_peer}: {error}");
                 break;
             }
         };
 
         let Ok(json) = serde_json::to_string(&response) else {
-            eprintln!("could not serialize browser response");
+            log::error!("could not serialize browser response");
             continue;
         };
         if socket.send(Message::Text(json.into())).await.is_err() {
+            log::info!("browser WebSocket closed before its response was sent peer={browser_peer}");
             break;
         }
     }
@@ -358,14 +547,18 @@ async fn handle_request(state: &AppState, request: ClientMessage) -> ServerMessa
     match request {
         ClientMessage::Connect { host, port } => connect(state, host, port).await,
         request => {
+            let request_summary = request.summary();
             let mut bridge = state.bridge.lock().await;
             let Some(connection) = bridge.as_mut() else {
+                log::warn!("rejected servobus request without MCU connection: {request_summary}");
                 return ServerMessage::Error {
                     message: "Connect to the MCU before sending servo commands".to_owned(),
                     bridge_connected: false,
                 };
             };
 
+            log::info!("servobus request peer={} {request_summary}", connection.peer);
+            let started = Instant::now();
             let result = match request {
                 ClientMessage::StartMotor {
                     id,
@@ -388,16 +581,30 @@ async fn handle_request(state: &AppState, request: ClientMessage) -> ServerMessa
             };
 
             match result {
-                Ok(response) => response,
+                Ok(response) => {
+                    log::info!(
+                        "servobus request completed peer={} elapsed_ms={} {request_summary}",
+                        connection.peer,
+                        started.elapsed().as_millis()
+                    );
+                    response
+                }
                 Err(error) => {
                     let bridge_connected = connection_is_usable_after(&error);
                     if bridge_connected {
-                        eprintln!(
-                            "servo command failed; retaining MCU connection {}: {error}",
-                            connection.peer
+                        log::warn!(
+                            "servobus request failed but MCU TCP connection is retained peer={} elapsed_ms={} request={} error={error}",
+                            connection.peer,
+                            started.elapsed().as_millis(),
+                            request_summary,
                         );
                     } else {
-                        eprintln!("dropping MCU connection {}: {error}", connection.peer);
+                        log::error!(
+                            "MCU TCP connection lost peer={} elapsed_ms={} request={} error={error}",
+                            connection.peer,
+                            started.elapsed().as_millis(),
+                            request_summary,
+                        );
                         *bridge = None;
                     }
                     ServerMessage::Error {
@@ -413,12 +620,14 @@ async fn handle_request(state: &AppState, request: ClientMessage) -> ServerMessa
 async fn connect(state: &AppState, host: String, port: u16) -> ServerMessage {
     let host = host.trim();
     if host.is_empty() {
+        log::warn!("rejected MCU connection request without a host name");
         return ServerMessage::Error {
             message: "The MCU host name or IP address is required".to_owned(),
             bridge_connected: false,
         };
     }
     if port == 0 {
+        log::warn!("rejected MCU connection request with port zero for host={host}");
         return ServerMessage::Error {
             message: "The MCU TCP port must be between 1 and 65535".to_owned(),
             bridge_connected: false,
@@ -434,15 +643,21 @@ async fn connect(state: &AppState, host: String, port: u16) -> ServerMessage {
         .as_ref()
         .is_some_and(|connection| connection.peer == peer)
     {
+        log::info!("reusing existing MCU TCP connection peer={peer}");
         return ServerMessage::Connected { address: peer };
     }
 
     // Switching targets deliberately closes the previous client before opening
     // the new one, so the prior one-client MCU can accept the new connection.
-    *bridge = None;
+    if let Some(previous) = bridge.take() {
+        log::info!("closing MCU TCP connection peer={} before switching to peer={peer}", previous.peer);
+    }
+    log::info!("opening MCU TCP connection peer={peer} timeout_ms={}", SERVO_TIMEOUT.as_millis());
+    let started = Instant::now();
     match timeout(SERVO_TIMEOUT, TcpStream::connect(&peer)).await {
         Ok(Ok(stream)) => {
             if let Err(error) = stream.set_nodelay(true) {
+                log::error!("MCU TCP connection setup failed peer={peer}: could not enable TCP_NODELAY: {error}");
                 return ServerMessage::Error {
                     message: format!("Connected to {peer}, but could not configure TCP: {error}"),
                     bridge_connected: false,
@@ -452,16 +667,32 @@ async fn connect(state: &AppState, host: String, port: u16) -> ServerMessage {
                 peer: peer.clone(),
                 stream,
             });
+            log::info!(
+                "MCU TCP connection established peer={peer} elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
             ServerMessage::Connected { address: peer }
         }
-        Ok(Err(error)) => ServerMessage::Error {
-            message: format!("Could not connect to {peer}: {error}"),
-            bridge_connected: false,
-        },
-        Err(_) => ServerMessage::Error {
-            message: format!("Timed out connecting to {peer}"),
-            bridge_connected: false,
-        },
+        Ok(Err(error)) => {
+            log::warn!(
+                "MCU TCP connection failed peer={peer} elapsed_ms={}: {error}",
+                started.elapsed().as_millis()
+            );
+            ServerMessage::Error {
+                message: format!("Could not connect to {peer}: {error}"),
+                bridge_connected: false,
+            }
+        }
+        Err(_) => {
+            log::warn!(
+                "MCU TCP connection timed out peer={peer} timeout_ms={}",
+                SERVO_TIMEOUT.as_millis()
+            );
+            ServerMessage::Error {
+                message: format!("Timed out connecting to {peer}"),
+                bridge_connected: false,
+            }
+        }
     }
 }
 
@@ -570,8 +801,15 @@ async fn read_positions(
     let mut errors = Vec::new();
     for &id in ids {
         match read_position(connection, id).await {
-            Ok(position) => positions.push(Position { id, position }),
+            Ok(position) => {
+                log::debug!("servobus position read peer={} servo={id} position={position}", connection.peer);
+                positions.push(Position { id, position });
+            }
             Err(error) if connection_is_usable_after(&error) => {
+                log::warn!(
+                    "servobus position read failed but MCU TCP connection is retained peer={} servo={id} error={error}",
+                    connection.peer
+                );
                 errors.push(format!("Servo {id}: {error}"));
             }
             Err(error) => return Err(error),
@@ -629,6 +867,11 @@ impl BridgeConnection {
         packet.extend_from_slice(&[id, length, instruction]);
         packet.extend_from_slice(parameters);
         packet.push(checksum(&packet[2..]));
+        log::debug!(
+            "servobus packet write peer={} servo={id} instruction=0x{instruction:02x} parameter_bytes={}",
+            self.peer,
+            parameters.len()
+        );
         write_with_timeout(&mut self.stream, &packet).await
     }
 

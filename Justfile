@@ -18,6 +18,14 @@ firmware-flash:
 host address="0.0.0.0:8787":
     cargo run --manifest-path host/Cargo.toml --target "{{host_target}}" --release --bin fetchline-host -- "{{address}}"
 
+# Start the panel with per-packet STS diagnostics in the host log.
+host-debug address="0.0.0.0:8787":
+    FETCHLINE_LOG=debug cargo run --manifest-path host/Cargo.toml --target "{{host_target}}" --release --bin fetchline-host -- "{{address}}"
+
+# Show the most recent host diagnostics.
+host-logs:
+    tail -n 200 "${XDG_STATE_HOME:-$HOME/.local/state}/fetchline-host/fetchline-host.log"
+
 # Store Wi-Fi credentials in the reserved flash sector over USB.
 provision-wifi port="/dev/ttyACM0":
     cargo run --manifest-path host/Cargo.toml --target "{{host_target}}" --bin provision-wifi -- "{{port}}"
