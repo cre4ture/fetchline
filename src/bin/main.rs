@@ -45,19 +45,22 @@ extern crate alloc;
 use alloc::format;
 use core::fmt;
 
-// These values are compiled into the firmware. build.rs tracks both variables,
-// so changing credentials always triggers a rebuild.
-const WIFI_SSID: &str = match option_env!("WIFI_SSID") {
-    Some(value) => value,
-    None => "",
-};
-const WIFI_PASSWORD: &str = match option_env!("WIFI_PASSWORD") {
-    Some(value) => value,
-    None => "",
-};
-
 const TCP_BUFFER_SIZE: usize = 4096;
 const COPY_BUFFER_SIZE: usize = 512;
+const WIFI_CONFIG_FLASH_OFFSET: usize = 0x003f_0000;
+const WIFI_CONFIG_MAGIC: [u8; 4] = *b"FLWC";
+const WIFI_CONFIG_VERSION: u8 = 1;
+const WIFI_SSID_MAX_LEN: usize = 32;
+const WIFI_PASSWORD_MAX_LEN: usize = 63;
+// The ROM reader requires a four-byte aligned length.
+const WIFI_CONFIG_READ_SIZE: usize = 108;
+
+struct WifiCredentials {
+    ssid: [u8; WIFI_SSID_MAX_LEN],
+    ssid_len: usize,
+    password: [u8; WIFI_PASSWORD_MAX_LEN],
+    password_len: usize,
+}
 
 // This creates the application descriptor required by the ESP-IDF bootloader.
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -148,19 +151,27 @@ async fn main(spawner: Spawner) -> ! {
     let software_interrupt = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timer_group.timer0, software_interrupt.software_interrupt0);
 
-    if WIFI_SSID.is_empty() {
-        warn!("WIFI_SSID is empty; rebuild with WIFI_SSID and WIFI_PASSWORD set");
-        show_status(&mut display, ["WIFI CONFIG", "SET BUILD", "VARIABLES"]);
-        display.flush().expect("failed to update OLED");
-        loop {
-            Timer::after(Duration::from_secs(60)).await;
+    let wifi_credentials = match load_wifi_credentials() {
+        Some(credentials) => credentials,
+        None => {
+            warn!("Wi-Fi credentials are not provisioned; use host provisioning over USB");
+            show_status(&mut display, ["WIFI CONFIG", "USB PROVISION", "REQUIRED"]);
+            display.flush().expect("failed to update OLED");
+            loop {
+                Timer::after(Duration::from_secs(60)).await;
+            }
         }
-    }
+    };
+    let wifi_ssid = core::str::from_utf8(&wifi_credentials.ssid[..wifi_credentials.ssid_len])
+        .expect("provisioned Wi-Fi SSID must be UTF-8");
+    let wifi_password =
+        core::str::from_utf8(&wifi_credentials.password[..wifi_credentials.password_len])
+            .expect("provisioned Wi-Fi password must be UTF-8");
 
     let station_config = WifiConfig::Station(
         StationConfig::default()
-            .with_ssid(WIFI_SSID)
-            .with_password(WIFI_PASSWORD.into()),
+            .with_ssid(wifi_ssid)
+            .with_password(wifi_password.into()),
     );
     let (controller, interfaces) = esp_radio::wifi::new(
         peripherals.WIFI,
@@ -340,7 +351,7 @@ where
 )]
 async fn wifi_connection(mut controller: WifiController<'static>) {
     loop {
-        info!("connecting to Wi-Fi SSID {WIFI_SSID:?}");
+        info!("connecting to provisioned Wi-Fi network");
         match controller.connect_async().await {
             Ok(info) => {
                 info!("Wi-Fi associated: {info:?}");
@@ -352,6 +363,63 @@ async fn wifi_connection(mut controller: WifiController<'static>) {
 
         Timer::after(Duration::from_secs(5)).await;
     }
+}
+
+#[allow(
+    clippy::large_stack_frames,
+    reason = "the provisioned credential record is read once during startup"
+)]
+fn load_wifi_credentials() -> Option<WifiCredentials> {
+    // The 4 MB flash has a dedicated 64 KB configuration area at its end. The
+    // application image lives at the low end of flash, so normal `espflash
+    // flash` updates leave this area untouched.
+    // The application partition is the only flash range mapped into DROM at
+    // startup. This record sits after that partition, so read it through the
+    // ESP ROM instead of dereferencing a mapped address.
+    let mut bytes = [0_u8; WIFI_CONFIG_READ_SIZE];
+    let result = unsafe {
+        esp_rom_sys::rom::spiflash::esp_rom_spiflash_read(
+            WIFI_CONFIG_FLASH_OFFSET as u32,
+            bytes.as_mut_ptr().cast(),
+            WIFI_CONFIG_READ_SIZE as u32,
+        )
+    };
+    if result != esp_rom_sys::rom::spiflash::ESP_ROM_SPIFLASH_RESULT_OK {
+        return None;
+    }
+    if bytes[..4] != WIFI_CONFIG_MAGIC || bytes[4] != WIFI_CONFIG_VERSION {
+        return None;
+    }
+    let ssid_len = bytes[5] as usize;
+    let password_len = bytes[6] as usize;
+    if ssid_len == 0 || ssid_len > WIFI_SSID_MAX_LEN || password_len > WIFI_PASSWORD_MAX_LEN {
+        return None;
+    }
+    let payload_len = ssid_len + password_len;
+    let expected_checksum = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    if wifi_config_checksum(&bytes[..8], &bytes[12..12 + payload_len]) != expected_checksum {
+        return None;
+    }
+    let mut credentials = WifiCredentials {
+        ssid: [0; WIFI_SSID_MAX_LEN],
+        ssid_len,
+        password: [0; WIFI_PASSWORD_MAX_LEN],
+        password_len,
+    };
+    credentials.ssid[..ssid_len].copy_from_slice(&bytes[12..12 + ssid_len]);
+    credentials.password[..password_len].copy_from_slice(&bytes[12 + ssid_len..12 + payload_len]);
+    core::str::from_utf8(&credentials.ssid[..ssid_len]).ok()?;
+    core::str::from_utf8(&credentials.password[..password_len]).ok()?;
+    Some(credentials)
+}
+
+fn wifi_config_checksum(header: &[u8], payload: &[u8]) -> u32 {
+    header
+        .iter()
+        .chain(payload)
+        .fold(0x811c_9dc5_u32, |hash, byte| {
+            (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+        })
 }
 
 #[embassy_executor::task]

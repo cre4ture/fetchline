@@ -1092,6 +1092,7 @@ dependencies = [
  "esp-hal",
  "esp-println",
  "esp-radio",
+ "esp-rom-sys",
  "esp-rtos",
  "log",
  "ssd1306",

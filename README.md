@@ -11,6 +11,47 @@ The bridge is transparent and binary-safe:
 Windows COM port <-> raw TCP port 3333 <-> ESP32-C3 UART1 <-> FE-URT-2 <-> STS servos
 ```
 
+## Linux host control panel
+
+The `host/` directory contains a Linux PC application with a browser UI for
+direct manual control. It owns the one raw-TCP connection to the MCU and serves
+the UI on the local machine, so no browser extension and no virtual COM driver
+is required.
+
+It controls Feetech **STS/SMS-compatible** servos with the normal STS protocol:
+
+- Servo 1 is a continuous motor control: clockwise, counter-clockwise, and
+  stop. Its maximum speed (percentage of the STS raw range) and acceleration
+  profile are configurable. Starting it selects the servo's continuous mode,
+  which is a persistent setting in the servo.
+- Servos 2–7 each have configurable IDs, live position sliders, maximum
+  acceleration, and holding torque limit. Each servo can be disabled; disabled
+  servos are never read or commanded. Current positions are read when the MCU
+  connects and when **Update positions** is pressed. A missing or faulty servo
+  is reported individually and does not disconnect the remaining servo controls.
+- The MCU address, IDs, and all control limits are saved in that browser's
+  `localStorage` and restore after a page reload. Nothing is saved remotely.
+
+Run it on the Linux PC with a recent stable Rust toolchain:
+
+```sh
+just host
+```
+
+The application listens on all network interfaces by default. Open
+`http://<Linux-PC-IP>:8787` from a device on the local network, then enter the
+IP address shown on the MCU OLED. An alternative listen address can be given as
+the first argument, for example:
+
+```sh
+just host 127.0.0.1:9000
+```
+
+Only one program may use the MCU TCP bridge. Close the virtual COM software and
+any other `fetchline-host` page before connecting this panel. The host has no
+authentication: every device that can reach its port can command physical
+actuators. Keep it on a trusted LAN, or firewall the port / use a VPN.
+
 It uses DHCP, reconnects Wi-Fi automatically, accepts one TCP client at a time,
 and keeps UART1 fixed at 1,000,000 baud, 8 data bits, no parity, and 1 stop bit.
 After DHCP completes, the OLED shows the assigned IPv4 address across two lines
@@ -84,19 +125,27 @@ and the `riscv32imc-unknown-none-elf` target. On Linux, the user running
 
 ## Configure, build, and flash
 
-Wi-Fi credentials are compile-time environment variables and are embedded in
-the firmware image. They are not stored in this repository.
+Wi-Fi credentials are never compiled into the firmware. They are provisioned
+once over USB into the final 64 KB of the board's 4 MB flash; normal firmware
+updates leave this configuration area untouched.
+
+Flash the firmware, then provision the network over USB:
 
 ```sh
-WIFI_SSID='your-2.4-GHz-network' \
-WIFI_PASSWORD='your-password' \
-cargo run --release
+just firmware-flash
+just provision-wifi /dev/ttyACM0
 ```
 
-ESP32-C3 supports 2.4 GHz Wi-Fi, not a 5 GHz-only network. If automatic download
-mode fails, hold **BOOT**, tap **RST**, release **BOOT**, and run the command
-again. Building without credentials succeeds, but that firmware stops at the
-`WIFI CONFIG / SET BUILD / VARIABLES` screen.
+`just` is a command runner. Install it on Linux, for example with
+`cargo install just`, then run `just` to list all available targets. The host
+and provisioning targets automatically select the Linux-native Rust target,
+which avoids accidentally building them for the ESP32-C3.
+
+The provisioner asks for the SSID and password and writes only the reserved
+configuration sector at `0x3f0000`. Never use `espflash erase-flash`, because
+that intentionally deletes this configuration. ESP32-C3 supports 2.4 GHz Wi-Fi,
+not a 5 GHz-only network. If automatic download mode fails, hold **BOOT**, tap
+**RST**, release **BOOT**, and run the command again.
 
 After DHCP completes, the USB log contains a line similar to:
 
@@ -145,10 +194,7 @@ VPN. Never expose or port-forward TCP 3333 to the public internet.
 ## Development checks
 
 ```sh
-cargo fmt --all --check
-WIFI_SSID='compile-test' WIFI_PASSWORD='compile-test-password' cargo build --release
-WIFI_SSID='compile-test' WIFI_PASSWORD='compile-test-password' \
-  cargo clippy --workspace --all-features -- -D warnings
+just check
 ```
 
 Useful references:
