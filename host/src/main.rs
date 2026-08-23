@@ -290,17 +290,26 @@ async fn main() {
         config_path: Arc::new(config_path),
     };
 
-    let app = Router::new()
+    let app = app(state);
+
+    if let Err(error) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    {
+        log::error!("HTTP server stopped unexpectedly: {error}");
+    }
+}
+
+fn app(state: AppState) -> Router {
+    Router::new()
         .route("/", get(index))
         .route("/app.js", get(javascript))
         .route("/styles.css", get(stylesheet))
         .route("/config", get(get_config).put(put_config))
         .route("/ws", get(websocket))
-        .with_state(state);
-
-    if let Err(error) = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await {
-        log::error!("HTTP server stopped unexpectedly: {error}");
-    }
+        .with_state(state)
 }
 
 fn host_log_path() -> PathBuf {
@@ -967,6 +976,12 @@ fn decode_signed_15(value: u16) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use tempfile::tempdir;
+    use tower::ServiceExt;
 
     #[test]
     fn creates_sts_checksums() {
@@ -1006,6 +1021,94 @@ mod tests {
     fn checks_status_packets() {
         // Status response: id 7, length 4, no error, low/high position.
         assert_eq!(checksum_for_status(7, 4, &[0, 0x34, 0x12]), 174);
+    }
+
+    #[test]
+    fn persists_and_loads_host_configuration() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let mut config = HostConfig::default();
+        config.endpoint.host = "192.168.178.146".to_owned();
+        config.joints[1].enabled = false;
+
+        persist_host_config(&path, &config).unwrap();
+        let loaded = load_host_config(&path);
+        assert_eq!(loaded.endpoint.host, "192.168.178.146");
+        assert!(!loaded.joints[1].enabled);
+    }
+
+    #[test]
+    fn invalid_saved_configuration_falls_back_to_defaults() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        fs::write(&path, "not JSON").unwrap();
+
+        let loaded = load_host_config(&path);
+        assert_eq!(loaded.endpoint.host, HostConfig::default().endpoint.host);
+        assert_eq!(loaded.joints.len(), 6);
+    }
+
+    #[test]
+    fn rotates_host_logs_without_losing_recent_archives() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("fetchline-host.log");
+        fs::write(&path, "current").unwrap();
+        fs::write(log_archive_path(&path, 1), "previous").unwrap();
+        fs::write(log_archive_path(&path, 2), "older").unwrap();
+
+        let mut replacement = rotate_log_file(&path).unwrap();
+        replacement.write_all(b"new").unwrap();
+        replacement.flush().unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(fs::read_to_string(log_archive_path(&path, 1)).unwrap(), "current");
+        assert_eq!(fs::read_to_string(log_archive_path(&path, 2)).unwrap(), "previous");
+        assert_eq!(fs::read_to_string(log_archive_path(&path, 3)).unwrap(), "older");
+    }
+
+    #[tokio::test]
+    async fn configuration_api_persists_shared_settings() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let state = test_state(path.clone());
+        let mut config = HostConfig::default();
+        config.endpoint.host = "192.168.178.146".to_owned();
+        config.motor.enabled = false;
+
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/config")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&config).unwrap()))
+            .unwrap();
+        let response = app(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let request = Request::builder().uri("/config").body(Body::empty()).unwrap();
+        let response = app(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let loaded: HostConfig = serde_json::from_slice(&body).unwrap();
+        assert_eq!(loaded.endpoint.host, "192.168.178.146");
+        assert!(!loaded.motor.enabled);
+        assert_eq!(load_host_config(&path).endpoint.host, "192.168.178.146");
+    }
+
+    #[tokio::test]
+    async fn configuration_api_rejects_invalid_servo_settings() {
+        let directory = tempdir().unwrap();
+        let state = test_state(directory.path().join("config.json"));
+        let mut config = HostConfig::default();
+        config.joints.clear();
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/config")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&config).unwrap()))
+            .unwrap();
+
+        let response = app(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1064,6 +1167,79 @@ mod tests {
             stream,
         };
         assert_eq!(read_position(&mut bridge, 2).await.unwrap(), 0x1234);
+        servo.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn position_read_rejects_a_reply_from_another_servo() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let servo = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            receive_packet(&mut stream).await;
+            stream.write_all(&status_packet(3, &[0, 0])).await.unwrap();
+        });
+
+        let mut bridge = bridge_for(address).await;
+        let error = read_position(&mut bridge, 2).await.unwrap_err();
+        assert!(error.contains("came from servo 3"));
+        assert!(connection_is_usable_after(&error));
+        servo.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn position_read_rejects_a_bad_checksum_without_dropping_tcp() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let servo = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            receive_packet(&mut stream).await;
+            let mut packet = status_packet(2, &[0, 0]);
+            *packet.last_mut().unwrap() ^= 0xff;
+            stream.write_all(&packet).await.unwrap();
+        });
+
+        let mut bridge = bridge_for(address).await;
+        let error = read_position(&mut bridge, 2).await.unwrap_err();
+        assert_eq!(error, "STS reply checksum did not match");
+        assert!(connection_is_usable_after(&error));
+        servo.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn position_read_reports_a_servo_status_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let servo = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            receive_packet(&mut stream).await;
+            stream
+                .write_all(&status_packet_with_error(2, 0x20, &[0, 0]))
+                .await
+                .unwrap();
+        });
+
+        let mut bridge = bridge_for(address).await;
+        let error = read_position(&mut bridge, 2).await.unwrap_err();
+        assert_eq!(error, "Servo 2 reported STS error 0x20");
+        assert!(connection_is_usable_after(&error));
+        servo.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn position_read_drops_tcp_after_a_truncated_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let servo = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            receive_packet(&mut stream).await;
+            stream.write_all(&[0xff, 0xff, 2, 4, 0]).await.unwrap();
+        });
+
+        let mut bridge = bridge_for(address).await;
+        let error = read_position(&mut bridge, 2).await.unwrap_err();
+        assert!(error.starts_with("Could not read STS servo reply"));
+        assert!(!connection_is_usable_after(&error));
         servo.await.unwrap();
     }
 
@@ -1136,6 +1312,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn connection_refusal_is_reported_without_a_bridge() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let response = connect(&AppState::default(), "127.0.0.1".to_owned(), port).await;
+        let ServerMessage::Error {
+            message,
+            bridge_connected,
+        } = response
+        else {
+            panic!("a closed local port must refuse the connection");
+        };
+        assert!(message.starts_with("Could not connect"));
+        assert!(!bridge_connected);
+    }
+
+    fn test_state(config_path: PathBuf) -> AppState {
+        AppState {
+            bridge: Arc::new(Mutex::new(None)),
+            config: Arc::new(Mutex::new(HostConfig::default())),
+            config_path: Arc::new(config_path),
+        }
+    }
+
+    async fn bridge_for(address: SocketAddr) -> BridgeConnection {
+        BridgeConnection {
+            peer: address.to_string(),
+            stream: TcpStream::connect(address).await.unwrap(),
+        }
+    }
+
     async fn receive_packet(stream: &mut TcpStream) -> Vec<u8> {
         let mut header_and_fixed = [0_u8; 4];
         stream.read_exact(&mut header_and_fixed).await.unwrap();
@@ -1147,8 +1356,12 @@ mod tests {
     }
 
     fn status_packet(id: u8, payload: &[u8]) -> Vec<u8> {
+        status_packet_with_error(id, 0, payload)
+    }
+
+    fn status_packet_with_error(id: u8, error: u8, payload: &[u8]) -> Vec<u8> {
         let length = u8::try_from(payload.len() + 2).unwrap();
-        let mut packet = vec![0xff, 0xff, id, length, 0];
+        let mut packet = vec![0xff, 0xff, id, length, error];
         packet.extend_from_slice(payload);
         packet.push(checksum_for_status(id, length, &packet[4..]));
         packet

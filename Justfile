@@ -36,3 +36,4 @@ check:
     cargo build --release
     cargo clippy --workspace --all-features -- -D warnings
     cargo check --manifest-path host/Cargo.toml --target "{{host_target}}"
+    cargo test --manifest-path host/Cargo.toml --target "{{host_target}}"
