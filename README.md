@@ -27,7 +27,8 @@ It controls Feetech **STS/SMS-compatible** servos with the normal STS protocol:
 - Servos 2–7 each have configurable IDs, live position sliders, maximum
   acceleration, and holding torque limit. Each servo can be disabled; disabled
   servos are never read or commanded. Current positions are read when the MCU
-  connects and when **Update positions** is pressed.
+  connects and when **Update positions** is pressed. A missing or faulty servo
+  is reported individually and does not disconnect the remaining servo controls.
 - The MCU address, IDs, and all control limits are saved in that browser's
   `localStorage` and restore after a page reload. Nothing is saved remotely.
 

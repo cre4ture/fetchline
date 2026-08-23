@@ -273,9 +273,15 @@ function handleServerMessage(message) {
     updatePosition(message.id, message.position);
   } else if (message.type === "positions") {
     message.positions.forEach(({ id, position }) => updatePosition(id, position));
+    if (message.errors.length > 0) {
+      setStatus(`${message.errors.join(" · ")} — MCU connection retained`, "error");
+    }
   } else if (message.type === "error") {
-    connectedToMcu = false;
-    setStatus(message.message, "error");
+    connectedToMcu = message.bridge_connected;
+    setStatus(
+      message.bridge_connected ? `${message.message} — MCU connection retained` : message.message,
+      "error",
+    );
   }
 }
 

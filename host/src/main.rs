@@ -86,11 +86,24 @@ enum Direction {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMessage {
-    Connected { address: String },
-    Complete { action: &'static str },
-    Position { id: u8, position: i16 },
-    Positions { positions: Vec<Position> },
-    Error { message: String },
+    Connected {
+        address: String,
+    },
+    Complete {
+        action: &'static str,
+    },
+    Position {
+        id: u8,
+        position: i16,
+    },
+    Positions {
+        positions: Vec<Position>,
+        errors: Vec<String>,
+    },
+    Error {
+        message: String,
+        bridge_connected: bool,
+    },
 }
 
 #[derive(Serialize)]
@@ -157,12 +170,14 @@ async fn client_session(mut socket: WebSocket, state: AppState) {
                 Ok(request) => handle_request(&state, request).await,
                 Err(error) => ServerMessage::Error {
                     message: format!("Invalid control request: {error}"),
+                    bridge_connected: false,
                 },
             },
             Ok(Message::Close(_)) => break,
             Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
             Ok(Message::Binary(_)) => ServerMessage::Error {
                 message: "Binary WebSocket messages are not supported".to_owned(),
+                bridge_connected: false,
             },
             Err(error) => {
                 eprintln!("browser connection closed: {error}");
@@ -188,6 +203,7 @@ async fn handle_request(state: &AppState, request: ClientMessage) -> ServerMessa
             let Some(connection) = bridge.as_mut() else {
                 return ServerMessage::Error {
                     message: "Connect to the MCU before sending servo commands".to_owned(),
+                    bridge_connected: false,
                 };
             };
 
@@ -208,18 +224,27 @@ async fn handle_request(state: &AppState, request: ClientMessage) -> ServerMessa
                 ClientMessage::ReadPosition { id } => read_position(connection, id)
                     .await
                     .map(|position| ServerMessage::Position { id, position }),
-                ClientMessage::ReadPositions { ids } => read_positions(connection, &ids)
-                    .await
-                    .map(|positions| ServerMessage::Positions { positions }),
+                ClientMessage::ReadPositions { ids } => read_positions(connection, &ids).await,
                 ClientMessage::Connect { .. } => unreachable!("connect is handled before locking"),
             };
 
             match result {
                 Ok(response) => response,
                 Err(error) => {
-                    eprintln!("dropping MCU connection {}: {error}", connection.peer);
-                    *bridge = None;
-                    ServerMessage::Error { message: error }
+                    let bridge_connected = connection_is_usable_after(&error);
+                    if bridge_connected {
+                        eprintln!(
+                            "servo command failed; retaining MCU connection {}: {error}",
+                            connection.peer
+                        );
+                    } else {
+                        eprintln!("dropping MCU connection {}: {error}", connection.peer);
+                        *bridge = None;
+                    }
+                    ServerMessage::Error {
+                        message: error,
+                        bridge_connected,
+                    }
                 }
             }
         }
@@ -231,11 +256,13 @@ async fn connect(state: &AppState, host: String, port: u16) -> ServerMessage {
     if host.is_empty() {
         return ServerMessage::Error {
             message: "The MCU host name or IP address is required".to_owned(),
+            bridge_connected: false,
         };
     }
     if port == 0 {
         return ServerMessage::Error {
             message: "The MCU TCP port must be between 1 and 65535".to_owned(),
+            bridge_connected: false,
         };
     }
 
@@ -245,6 +272,7 @@ async fn connect(state: &AppState, host: String, port: u16) -> ServerMessage {
             if let Err(error) = stream.set_nodelay(true) {
                 return ServerMessage::Error {
                     message: format!("Connected to {peer}, but could not configure TCP: {error}"),
+                    bridge_connected: false,
                 };
             }
             let mut bridge = state.bridge.lock().await;
@@ -256,9 +284,11 @@ async fn connect(state: &AppState, host: String, port: u16) -> ServerMessage {
         }
         Ok(Err(error)) => ServerMessage::Error {
             message: format!("Could not connect to {peer}: {error}"),
+            bridge_connected: false,
         },
         Err(_) => ServerMessage::Error {
             message: format!("Timed out connecting to {peer}"),
+            bridge_connected: false,
         },
     }
 }
@@ -360,18 +390,31 @@ async fn read_position(connection: &mut BridgeConnection, id: u8) -> Result<i16,
 async fn read_positions(
     connection: &mut BridgeConnection,
     ids: &[u8],
-) -> Result<Vec<Position>, String> {
+) -> Result<ServerMessage, String> {
     if ids.len() > 6 {
         return Err("At most six position servos can be read at once".to_owned());
     }
     let mut positions = Vec::with_capacity(ids.len());
+    let mut errors = Vec::new();
     for &id in ids {
-        positions.push(Position {
-            id,
-            position: read_position(connection, id).await?,
-        });
+        match read_position(connection, id).await {
+            Ok(position) => positions.push(Position { id, position }),
+            Err(error) if connection_is_usable_after(&error) => {
+                errors.push(format!("Servo {id}: {error}"));
+            }
+            Err(error) => return Err(error),
+        }
     }
-    Ok(positions)
+    Ok(ServerMessage::Positions { positions, errors })
+}
+
+/// Servo replies are independent of the TCP transport. Retain the bridge after
+/// a servo timeout or malformed/error reply so the remaining servos remain
+/// controllable. Broken TCP I/O is the only case that requires reconnecting.
+fn connection_is_usable_after(error: &str) -> bool {
+    !error.starts_with("Timed out sending command to the MCU")
+        && !error.starts_with("Could not send command to the MCU")
+        && !error.starts_with("Could not read STS servo reply")
 }
 
 fn validate_id(id: u8) -> Result<(), String> {
@@ -532,6 +575,19 @@ mod tests {
     }
 
     #[test]
+    fn servo_timeouts_do_not_require_reconnecting_the_bridge() {
+        assert!(connection_is_usable_after(
+            "Timed out waiting for an STS servo reply"
+        ));
+        assert!(connection_is_usable_after(
+            "STS reply checksum did not match"
+        ));
+        assert!(!connection_is_usable_after(
+            "Could not send command to the MCU: Connection reset by peer"
+        ));
+    }
+
+    #[test]
     fn checks_status_packets() {
         // Status response: id 7, length 4, no error, low/high position.
         assert_eq!(checksum_for_status(7, 4, &[0, 0x34, 0x12]), 174);
@@ -593,6 +649,49 @@ mod tests {
             stream,
         };
         assert_eq!(read_position(&mut bridge, 2).await.unwrap(), 0x1234);
+        servo.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn position_refresh_continues_after_one_servo_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let servo = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                receive_packet(&mut stream).await,
+                vec![0xff, 0xff, 2, 4, 2, 56, 2, 189]
+            );
+            stream.write_all(&status_packet(2, &[2, 0])).await.unwrap();
+
+            // Intentionally do not answer servo 3. The next packet proves the
+            // host retained the TCP bridge and continued with servo 4.
+            assert_eq!(
+                receive_packet(&mut stream).await,
+                vec![0xff, 0xff, 3, 4, 2, 56, 2, 188]
+            );
+            assert_eq!(
+                receive_packet(&mut stream).await,
+                vec![0xff, 0xff, 4, 4, 2, 56, 2, 187]
+            );
+            stream.write_all(&status_packet(4, &[4, 0])).await.unwrap();
+        });
+
+        let stream = TcpStream::connect(address).await.unwrap();
+        let mut bridge = BridgeConnection {
+            peer: address.to_string(),
+            stream,
+        };
+        let ServerMessage::Positions { positions, errors } =
+            read_positions(&mut bridge, &[2, 3, 4]).await.unwrap()
+        else {
+            panic!("position refresh should return a positions response");
+        };
+        assert_eq!(positions.len(), 2);
+        assert_eq!(positions[0].id, 2);
+        assert_eq!(positions[1].id, 4);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].starts_with("Servo 3: Timed out"));
         servo.await.unwrap();
     }
 
