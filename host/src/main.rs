@@ -1,8 +1,8 @@
 //! Linux-local control panel for Feetech STS servos behind a fetchline bridge.
 //!
 //! A browser cannot make a raw TCP connection to the ESP32.  This program owns
-//! that connection and exposes only a loopback HTTP/WebSocket interface to the
-//! bundled browser UI.
+//! that connection and exposes an HTTP/WebSocket interface to the bundled
+//! browser UI.
 
 use std::{env, sync::Arc, time::Duration};
 
@@ -24,7 +24,7 @@ use tokio::{
     time::timeout,
 };
 
-const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:8787";
+const DEFAULT_LISTEN_ADDRESS: &str = "0.0.0.0:8787";
 const SERVO_TIMEOUT: Duration = Duration::from_millis(750);
 const STS_HEADER: [u8; 2] = [0xff, 0xff];
 const STS_BROADCAST_ID: u8 = 0xfe;
@@ -108,8 +108,8 @@ async fn main() {
         .await
         .unwrap_or_else(|error| panic!("could not bind {listen_address}: {error}"));
 
-    println!("Fetchline host UI: http://{listen_address}");
-    println!("This control service listens on loopback by default.");
+    println!("Fetchline host UI listening on http://{listen_address}");
+    println!("Open http://<LAN-IP-of-this-PC>:8787 from a device on the local network.");
 
     let app = Router::new()
         .route("/", get(index))

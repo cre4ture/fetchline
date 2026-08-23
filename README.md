@@ -37,9 +37,10 @@ HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
 cargo run --manifest-path host/Cargo.toml --target "$HOST_TARGET" --release
 ```
 
-Then open [http://127.0.0.1:8787](http://127.0.0.1:8787) and enter the IP
-address shown on the MCU OLED. An alternative local listen address can be given
-as the first argument, for example:
+The application listens on all network interfaces by default. Open
+`http://<Linux-PC-IP>:8787` from a device on the local network, then enter the
+IP address shown on the MCU OLED. An alternative listen address can be given as
+the first argument, for example:
 
 ```sh
 HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
@@ -47,8 +48,9 @@ cargo run --manifest-path host/Cargo.toml --target "$HOST_TARGET" --release -- 1
 ```
 
 Only one program may use the MCU TCP bridge. Close the virtual COM software and
-any other `fetchline-host` page before connecting this panel. The host binds to
-loopback by default, deliberately keeping servo control off the network.
+any other `fetchline-host` page before connecting this panel. The host has no
+authentication: every device that can reach its port can command physical
+actuators. Keep it on a trusted LAN, or firewall the port / use a VPN.
 
 It uses DHCP, reconnects Wi-Fi automatically, accepts one TCP client at a time,
 and keeps UART1 fixed at 1,000,000 baud, 8 data bits, no parity, and 1 stop bit.
