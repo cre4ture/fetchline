@@ -35,8 +35,7 @@ It controls Feetech **STS/SMS-compatible** servos with the normal STS protocol:
 Run it on the Linux PC with a recent stable Rust toolchain:
 
 ```sh
-HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
-cargo run --manifest-path host/Cargo.toml --target "$HOST_TARGET" --release
+just host
 ```
 
 The application listens on all network interfaces by default. Open
@@ -45,8 +44,7 @@ IP address shown on the MCU OLED. An alternative listen address can be given as
 the first argument, for example:
 
 ```sh
-HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
-cargo run --manifest-path host/Cargo.toml --target "$HOST_TARGET" --release -- 127.0.0.1:9000
+just host 127.0.0.1:9000
 ```
 
 Only one program may use the MCU TCP bridge. Close the virtual COM software and
@@ -134,9 +132,14 @@ updates leave this configuration area untouched.
 Flash the firmware, then provision the network over USB:
 
 ```sh
-cargo run --release
-cargo run --manifest-path host/Cargo.toml --bin provision-wifi -- /dev/ttyACM0
+just firmware-flash
+just provision-wifi /dev/ttyACM0
 ```
+
+`just` is a command runner. Install it on Linux, for example with
+`cargo install just`, then run `just` to list all available targets. The host
+and provisioning targets automatically select the Linux-native Rust target,
+which avoids accidentally building them for the ESP32-C3.
 
 The provisioner asks for the SSID and password and writes only the reserved
 configuration sector at `0x3f0000`. Never use `espflash erase-flash`, because
@@ -191,9 +194,7 @@ VPN. Never expose or port-forward TCP 3333 to the public internet.
 ## Development checks
 
 ```sh
-cargo fmt --all --check
-cargo build --release
-cargo clippy --workspace --all-features -- -D warnings
+just check
 ```
 
 Useful references:
