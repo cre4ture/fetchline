@@ -25,8 +25,9 @@ It controls Feetech **STS/SMS-compatible** servos with the normal STS protocol:
   profile are configurable. Starting it selects the servo's continuous mode,
   which is a persistent setting in the servo.
 - Servos 2–7 each have configurable IDs, live position sliders, maximum
-  acceleration, and holding torque limit. Current positions are read when the
-  MCU connects and when **Update positions** is pressed.
+  acceleration, and holding torque limit. Each servo can be disabled; disabled
+  servos are never read or commanded. Current positions are read when the MCU
+  connects and when **Update positions** is pressed.
 - The MCU address, IDs, and all control limits are saved in that browser's
   `localStorage` and restore after a page reload. Nothing is saved remotely.
 

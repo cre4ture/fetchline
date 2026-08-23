@@ -54,12 +54,16 @@ button.stop { background: #ec7969; color: #2d0b08; }
 .range-label { color: #c4d1c9; font-size: .82rem; font-weight: 650; }
 output { color: #8de2b0; font-variant-numeric: tabular-nums; }
 input[type="range"] { min-width: 0; padding: 0; accent-color: #8de2b0; }
+input[type="checkbox"] { width: auto; padding: 0; accent-color: #8de2b0; }
+button:disabled, input:disabled { cursor: not-allowed; opacity: .45; }
+.enabled-toggle { display: flex; align-items: center; gap: .45rem; color: #d8eee0; font-size: .78rem; }
 .motor-actions { justify-content: flex-start; flex-wrap: wrap; margin-top: 1.2rem; }
 
 .section-heading { margin: 0 .05rem .35rem; }
 .position-hint { margin-top: 0; }
 .position-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
 .joint-card { min-height: 15rem; }
+.joint-card.is-disabled { border-style: dashed; opacity: .7; }
 .joint-title { align-items: start; }
 .joint-number { color: #8de2b0; font-size: .76rem; font-weight: 800; letter-spacing: .09em; }
 .position-readout { margin: .35rem 0 1rem; color: #f5fff6; font-size: 1.7rem; font-variant-numeric: tabular-nums; letter-spacing: -.04em; }

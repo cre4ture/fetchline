@@ -5,9 +5,10 @@ const CONTROL_INTERVAL_MS = 45;
 
 const defaults = {
   endpoint: { host: "192.168.1.123", port: 3333 },
-  motor: { id: 1, speedPercent: 25, acceleration: 20 },
+  motor: { id: 1, enabled: true, speedPercent: 25, acceleration: 20 },
   joints: Array.from({ length: 6 }, (_, index) => ({
     id: index + 2,
+    enabled: true,
     acceleration: 20,
     torquePercent: 100,
   })),
@@ -30,11 +31,13 @@ function loadConfig() {
       },
       motor: {
         id: clampNumber(stored.motor?.id, 1, 253, defaults.motor.id),
+        enabled: stored.motor?.enabled !== false,
         speedPercent: clampNumber(stored.motor?.speedPercent, 0, 100, defaults.motor.speedPercent),
         acceleration: clampNumber(stored.motor?.acceleration, 0, 254, defaults.motor.acceleration),
       },
       joints: Array.from({ length: 6 }, (_, index) => ({
         id: clampNumber(stored.joints?.[index]?.id, 1, 253, index + 2),
+        enabled: stored.joints?.[index]?.enabled !== false,
         acceleration: clampNumber(stored.joints?.[index]?.acceleration, 0, 254, 20),
         torquePercent: clampNumber(stored.joints?.[index]?.torquePercent, 0, 100, 100),
       })),
@@ -79,7 +82,7 @@ function renderMotor() {
   document.querySelector("#motor-panel").innerHTML = `
     <div class="card-heading">
       <div><p class="eyebrow">SERVO 1</p><h2 id="motor-title">Continuous motor</h2></div>
-      <span class="joint-number">RUN UNTIL STOP</span>
+      <label class="enabled-toggle"><input id="motor-enabled" type="checkbox" ${motor.enabled ? "checked" : ""}><span>Enabled</span></label>
     </div>
     <div class="motor-layout">
       <label>Servo ID
@@ -97,9 +100,9 @@ function renderMotor() {
       </div>
     </div>
     <div class="motor-actions">
-      <button id="motor-clockwise" type="button">Run clockwise</button>
-      <button id="motor-counterclockwise" type="button" class="quiet">Run counter-clockwise</button>
-      <button id="motor-stop" type="button" class="stop">Stop</button>
+      <button id="motor-clockwise" type="button" ${motor.enabled ? "" : "disabled"}>Run clockwise</button>
+      <button id="motor-counterclockwise" type="button" class="quiet" ${motor.enabled ? "" : "disabled"}>Run counter-clockwise</button>
+      <button id="motor-stop" type="button" class="stop" ${motor.enabled ? "" : "disabled"}>Stop</button>
     </div>
     <p class="hint">Run selects STS continuous mode for this servo (a persistent servo setting), enables torque, and then starts it at the selected speed.</p>`;
 
@@ -107,6 +110,11 @@ function renderMotor() {
     config.motor.id = clampNumber(event.target.value, 1, 253, config.motor.id);
     event.target.value = config.motor.id;
     saveConfig();
+  });
+  document.querySelector("#motor-enabled").addEventListener("change", (event) => {
+    config.motor.enabled = event.target.checked;
+    saveConfig();
+    renderMotor();
   });
   document.querySelector("#motor-speed").addEventListener("input", (event) => {
     config.motor.speedPercent = Number(event.target.value);
@@ -127,14 +135,15 @@ function renderMotor() {
 function renderJoints() {
   document.querySelector("#position-panels").innerHTML = config.joints.map((joint, index) => {
     const position = currentPositions.get(index) ?? 2048;
+    const disabled = joint.enabled ? "" : "disabled";
     return `
-      <article class="card joint-card" data-joint-index="${index}">
+      <article class="card joint-card ${joint.enabled ? "" : "is-disabled"}" data-joint-index="${index}" aria-disabled="${!joint.enabled}">
         <div class="joint-title">
           <div><p class="eyebrow">SERVO ${index + 2}</p><h2>Position hold</h2></div>
-          <span class="joint-number">ID ${joint.id}</span>
+          <label class="enabled-toggle"><input data-enabled-index="${index}" type="checkbox" ${joint.enabled ? "checked" : ""}><span>Enabled</span></label>
         </div>
         <p class="position-readout"><output id="position-value-${index}">${position}</output> <span>/ 4095 steps</span></p>
-        <input class="position-slider" data-position-index="${index}" type="range" min="${POSITION_MIN}" max="${POSITION_MAX}" value="${Math.max(POSITION_MIN, Math.min(POSITION_MAX, position))}" aria-label="Servo ${index + 2} target position">
+        <input class="position-slider" data-position-index="${index}" type="range" min="${POSITION_MIN}" max="${POSITION_MAX}" value="${Math.max(POSITION_MIN, Math.min(POSITION_MAX, position))}" aria-label="Servo ${index + 2} target position" ${disabled}>
         <div class="joint-settings">
           <label>Servo ID
             <input data-id-index="${index}" type="number" min="1" max="253" value="${joint.id}">
@@ -154,6 +163,16 @@ function renderJoints() {
     const index = Number(event.target.dataset.idIndex);
     config.joints[index].id = clampNumber(event.target.value, 1, 253, config.joints[index].id);
     event.target.value = config.joints[index].id;
+    saveConfig();
+    renderJoints();
+  }));
+  document.querySelectorAll("[data-enabled-index]").forEach((element) => element.addEventListener("change", (event) => {
+    const index = Number(event.target.dataset.enabledIndex);
+    config.joints[index].enabled = event.target.checked;
+    if (!config.joints[index].enabled) {
+      clearTimeout(queuedMoves.get(index));
+      queuedMoves.delete(index);
+    }
     saveConfig();
     renderJoints();
   }));
@@ -177,6 +196,7 @@ function renderJoints() {
 }
 
 function startMotor(direction) {
+  if (!config.motor.enabled) return;
   send({
     type: "start_motor",
     id: config.motor.id,
@@ -187,6 +207,7 @@ function startMotor(direction) {
 }
 
 function queuePositionMove(index, position, flush = false) {
+  if (!config.joints[index].enabled) return;
   currentPositions.set(index, position);
   document.querySelector(`#position-value-${index}`).value = position;
   const pending = queuedMoves.get(index);
@@ -194,6 +215,7 @@ function queuePositionMove(index, position, flush = false) {
   const sendMove = () => {
     queuedMoves.delete(index);
     const joint = config.joints[index];
+    if (!joint.enabled) return;
     send({
       type: "move_position",
       id: joint.id,
@@ -213,7 +235,8 @@ function connectMcu() {
 }
 
 function refreshPositions() {
-  send({ type: "read_positions", ids: config.joints.map((joint) => joint.id) });
+  const ids = config.joints.filter((joint) => joint.enabled).map((joint) => joint.id);
+  if (ids.length > 0) send({ type: "read_positions", ids });
 }
 
 function send(message, allowedBeforeMcuConnect = false) {
