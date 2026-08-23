@@ -4,7 +4,12 @@
 //! that connection and exposes an HTTP/WebSocket interface to the bundled
 //! browser UI.
 
-use std::{env, sync::Arc, time::Duration};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     Router,
@@ -12,9 +17,10 @@ use axum::{
         State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{HeaderValue, header},
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
+    Json,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -36,14 +42,72 @@ const STS_ACCELERATION: u8 = 41;
 const STS_TORQUE_LIMIT: u8 = 48;
 const STS_PRESENT_POSITION: u8 = 56;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct AppState {
     bridge: Arc<Mutex<Option<BridgeConnection>>>,
+    config: Arc<Mutex<HostConfig>>,
+    config_path: Arc<PathBuf>,
 }
 
 struct BridgeConnection {
     peer: String,
     stream: TcpStream,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HostConfig {
+    endpoint: EndpointConfig,
+    motor: MotorConfig,
+    joints: Vec<JointConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct EndpointConfig {
+    host: String,
+    port: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct MotorConfig {
+    id: u8,
+    enabled: bool,
+    #[serde(rename = "speedPercent")]
+    speed_percent: u8,
+    acceleration: u8,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct JointConfig {
+    id: u8,
+    enabled: bool,
+    acceleration: u8,
+    #[serde(rename = "torquePercent")]
+    torque_percent: u8,
+}
+
+impl Default for HostConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: EndpointConfig {
+                host: "192.168.1.123".to_owned(),
+                port: 3333,
+            },
+            motor: MotorConfig {
+                id: 1,
+                enabled: true,
+                speed_percent: 25,
+                acceleration: 20,
+            },
+            joints: (2..=7)
+                .map(|id| JointConfig {
+                    id,
+                    enabled: true,
+                    acceleration: 20,
+                    torque_percent: 100,
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,16 +188,111 @@ async fn main() {
     println!("Fetchline host UI listening on http://{listen_address}");
     println!("Open http://<LAN-IP-of-this-PC>:8787 from a device on the local network.");
 
+    let config_path = host_config_path();
+    let config = load_host_config(&config_path);
+    println!("Host configuration: {}", config_path.display());
+    let state = AppState {
+        bridge: Arc::new(Mutex::new(None)),
+        config: Arc::new(Mutex::new(config)),
+        config_path: Arc::new(config_path),
+    };
+
     let app = Router::new()
         .route("/", get(index))
         .route("/app.js", get(javascript))
         .route("/styles.css", get(stylesheet))
+        .route("/config", get(get_config).put(put_config))
         .route("/ws", get(websocket))
-        .with_state(AppState::default());
+        .with_state(state);
 
     axum::serve(listener, app)
         .await
         .expect("local web server stopped unexpectedly");
+}
+
+fn host_config_path() -> PathBuf {
+    if let Some(path) = env::var_os("XDG_CONFIG_HOME").filter(|path| !path.is_empty()) {
+        return PathBuf::from(path).join("fetchline-host/config.json");
+    }
+    if let Some(home) = env::var_os("HOME").filter(|path| !path.is_empty()) {
+        return PathBuf::from(home).join(".config/fetchline-host/config.json");
+    }
+    PathBuf::from("fetchline-host-config.json")
+}
+
+fn load_host_config(path: &Path) -> HostConfig {
+    match fs::read_to_string(path) {
+        Ok(contents) => match serde_json::from_str::<HostConfig>(&contents) {
+            Ok(config) => match validate_host_config(&config) {
+                Ok(()) => config,
+                Err(error) => {
+                    eprintln!("ignoring invalid host configuration {}: {error}", path.display());
+                    HostConfig::default()
+                }
+            },
+            Err(error) => {
+                eprintln!("ignoring invalid host configuration {}: {error}", path.display());
+                HostConfig::default()
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => HostConfig::default(),
+        Err(error) => {
+            eprintln!("could not read host configuration {}: {error}", path.display());
+            HostConfig::default()
+        }
+    }
+}
+
+fn validate_host_config(config: &HostConfig) -> Result<(), String> {
+    if config.endpoint.host.trim().is_empty() || config.endpoint.port == 0 {
+        return Err("MCU host and TCP port are required".to_owned());
+    }
+    if config.motor.id == 0 || config.motor.id == STS_BROADCAST_ID {
+        return Err("motor ID must be between 1 and 253".to_owned());
+    }
+    if config.motor.speed_percent > 100 {
+        return Err("motor speed percentage must be between 0 and 100".to_owned());
+    }
+    if config.joints.len() != 6 {
+        return Err("exactly six position servo configurations are required".to_owned());
+    }
+    for joint in &config.joints {
+        if joint.id == 0 || joint.id == STS_BROADCAST_ID {
+            return Err("servo IDs must be between 1 and 253".to_owned());
+        }
+        if joint.torque_percent > 100 {
+            return Err("holding torque percentage must be between 0 and 100".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn persist_host_config(path: &Path, config: &HostConfig) -> Result<(), String> {
+    let parent = path.parent().ok_or("host configuration path has no parent directory")?;
+    fs::create_dir_all(parent).map_err(|error| format!("could not create config directory: {error}"))?;
+    let temporary = path.with_extension("json.tmp");
+    let contents = serde_json::to_vec_pretty(config)
+        .map_err(|error| format!("could not encode host configuration: {error}"))?;
+    fs::write(&temporary, contents)
+        .map_err(|error| format!("could not write host configuration: {error}"))?;
+    fs::rename(&temporary, path)
+        .map_err(|error| format!("could not replace host configuration: {error}"))
+}
+
+async fn get_config(State(state): State<AppState>) -> Json<HostConfig> {
+    Json(state.config.lock().await.clone())
+}
+
+async fn put_config(
+    State(state): State<AppState>,
+    Json(mut config): Json<HostConfig>,
+) -> Result<Json<HostConfig>, (StatusCode, String)> {
+    config.endpoint.host = config.endpoint.host.trim().to_owned();
+    validate_host_config(&config).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    persist_host_config(&state.config_path, &config)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    *state.config.lock().await = config.clone();
+    Ok(Json(config))
 }
 
 async fn index() -> Response {

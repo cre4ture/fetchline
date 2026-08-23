@@ -29,8 +29,10 @@ It controls Feetech **STS/SMS-compatible** servos with the normal STS protocol:
   servos are never read or commanded. Current positions are read when the MCU
   connects and when **Update positions** is pressed. A missing or faulty servo
   is reported individually and does not disconnect the remaining servo controls.
-- The MCU address, IDs, and all control limits are saved in that browser's
-  `localStorage` and restore after a page reload. Nothing is saved remotely.
+- The MCU address, IDs, enabled state, and all control limits are stored by
+  the Linux host in `~/.config/fetchline-host/config.json` (or
+  `$XDG_CONFIG_HOME/fetchline-host/config.json`). Every browser opening the
+  host UI therefore receives the same configuration after a reload.
 
 Run it on the Linux PC with a recent stable Rust toolchain:
 
