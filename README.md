@@ -127,19 +127,22 @@ and the `riscv32imc-unknown-none-elf` target. On Linux, the user running
 
 ## Configure, build, and flash
 
-Wi-Fi credentials are compile-time environment variables and are embedded in
-the firmware image. They are not stored in this repository.
+Wi-Fi credentials are never compiled into the firmware. They are provisioned
+once over USB into the final 64 KB of the board's 4 MB flash; normal firmware
+updates leave this configuration area untouched.
+
+Flash the firmware, then provision the network over USB:
 
 ```sh
-WIFI_SSID='your-2.4-GHz-network' \
-WIFI_PASSWORD='your-password' \
 cargo run --release
+cargo run --manifest-path host/Cargo.toml --bin provision-wifi -- /dev/ttyACM0
 ```
 
-ESP32-C3 supports 2.4 GHz Wi-Fi, not a 5 GHz-only network. If automatic download
-mode fails, hold **BOOT**, tap **RST**, release **BOOT**, and run the command
-again. Building without credentials succeeds, but that firmware stops at the
-`WIFI CONFIG / SET BUILD / VARIABLES` screen.
+The provisioner asks for the SSID and password and writes only the reserved
+configuration sector at `0x3f0000`. Never use `espflash erase-flash`, because
+that intentionally deletes this configuration. ESP32-C3 supports 2.4 GHz Wi-Fi,
+not a 5 GHz-only network. If automatic download mode fails, hold **BOOT**, tap
+**RST**, release **BOOT**, and run the command again.
 
 After DHCP completes, the USB log contains a line similar to:
 
@@ -189,9 +192,8 @@ VPN. Never expose or port-forward TCP 3333 to the public internet.
 
 ```sh
 cargo fmt --all --check
-WIFI_SSID='compile-test' WIFI_PASSWORD='compile-test-password' cargo build --release
-WIFI_SSID='compile-test' WIFI_PASSWORD='compile-test-password' \
-  cargo clippy --workspace --all-features -- -D warnings
+cargo build --release
+cargo clippy --workspace --all-features -- -D warnings
 ```
 
 Useful references:
