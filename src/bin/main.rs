@@ -8,8 +8,16 @@
 #![deny(clippy::large_stack_frames)]
 
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, select};
-use embassy_net::{Runner, StackResources, tcp::TcpSocket};
+#[path = "../websocket.rs"]
+mod websocket;
+
+use embassy_futures::select::{Either, Either3, select, select3};
+use embassy_net::{Runner, Stack, StackResources, tcp::TcpSocket};
+use embassy_sync::{
+    blocking_mutex::{Mutex as BlockingMutex, raw::CriticalSectionRawMutex},
+    mutex::Mutex,
+    signal::Signal,
+};
 use embassy_time::{Duration, Timer, with_timeout};
 use embedded_graphics::{
     draw_target::DrawTarget,
@@ -19,7 +27,7 @@ use embedded_graphics::{
     primitives::{PrimitiveStyle, Rectangle},
     text::{Alignment, Baseline, Text, TextStyleBuilder},
 };
-use embedded_io_async::{Read, Write};
+use embedded_io_async::Write;
 use esp_backtrace as _;
 use esp_hal::{
     Async,
@@ -38,19 +46,20 @@ use fetchline::board::{
     OLED_CONTROLLER, OLED_HEIGHT, OLED_I2C_ADDRESS, OLED_WIDTH, SERVO_UART_BAUD,
     SERVO_UART_RX_GPIO, SERVO_UART_TX_GPIO,
 };
-use fetchline_protocol::{
-    CONTROLLER_TCP_PORT, Command, DecodeError, ErrorCode, FRAME_LEN, Frame, Response,
-};
+use fetchline_protocol::{CONTROLLER_TCP_PORT, RAW_TUNNEL_TCP_PORT};
 use log::{info, warn};
+use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use ssd1306::{I2CDisplayInterface, Ssd1306, prelude::*};
 
 extern crate alloc;
 
 use alloc::format;
-use core::fmt;
+use core::cell::Cell;
 
 const TCP_BUFFER_SIZE: usize = 4096;
 const COPY_BUFFER_SIZE: usize = 512;
+const JSON_RPC_BUFFER_SIZE: usize = 1024;
+const MAX_POSITION_BATCH: usize = 6;
 const STS_RESPONSE_TIMEOUT: Duration = Duration::from_millis(50);
 const STS_HEADER: [u8; 2] = [0xff, 0xff];
 const STS_BROADCAST_ID: u8 = 0xfe;
@@ -86,84 +95,269 @@ macro_rules! mk_static {
     }};
 }
 
-#[derive(Clone, Copy)]
-enum CopyDirection {
-    NetworkToUart,
-    UartToNetwork,
-}
-
-#[derive(Clone, Copy)]
-enum BridgeExit {
-    InputClosed(CopyDirection),
-    ReadError(CopyDirection),
-    WriteError(CopyDirection),
-}
-
-impl fmt::Display for CopyDirection {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NetworkToUart => formatter.write_str("network to UART"),
-            Self::UartToNetwork => formatter.write_str("UART to network"),
-        }
-    }
-}
-
-impl fmt::Display for BridgeExit {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InputClosed(direction) => write!(formatter, "{direction} input closed"),
-            Self::ReadError(direction) => write!(formatter, "{direction} read error"),
-            Self::WriteError(direction) => write!(formatter, "{direction} write error"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum ControllerSessionExit {
-    PeerClosed,
-    InvalidFrame(DecodeError),
-    DebugTunnelRequested,
-}
-
 #[derive(Clone, Copy, Debug)]
 enum ServoFailure {
     InvalidServoId,
     InvalidArgument,
     Timeout,
     InvalidReply,
-    ReportedError(u8),
+    ReportedError,
     Transport,
 }
 
 impl ServoFailure {
-    const fn response(self) -> Response {
+    const fn rpc_failure(self) -> RpcFailure {
         match self {
-            Self::InvalidServoId => Response::Error {
-                code: ErrorCode::InvalidServoId,
-                detail: 0,
-            },
-            Self::InvalidArgument => Response::Error {
-                code: ErrorCode::InvalidArgument,
-                detail: 0,
-            },
-            Self::Timeout => Response::Error {
-                code: ErrorCode::ServoTimeout,
-                detail: 0,
-            },
-            Self::InvalidReply => Response::Error {
-                code: ErrorCode::InvalidServoReply,
-                detail: 0,
-            },
-            Self::ReportedError(status) => Response::Error {
-                code: ErrorCode::ServoReportedError,
-                detail: status as u16,
-            },
-            Self::Transport => Response::Error {
-                code: ErrorCode::ServoTransport,
-                detail: 0,
-            },
+            Self::InvalidServoId | Self::InvalidArgument => RpcFailure::INVALID_PARAMS,
+            Self::Timeout => RpcFailure::SERVO_TIMEOUT,
+            Self::InvalidReply => RpcFailure::SERVO_REPLY,
+            Self::ReportedError => RpcFailure::SERVO_REPORTED_ERROR,
+            Self::Transport => RpcFailure::SERVO_TRANSPORT,
         }
     }
+}
+
+type SharedUartRx = Mutex<CriticalSectionRawMutex, UartRx<'static, Async>>;
+type SharedUartTx = Mutex<CriticalSectionRawMutex, UartTx<'static, Async>>;
+
+#[derive(Clone, Copy)]
+enum RawTunnelCommand {
+    Enable,
+    Disable,
+}
+
+struct RawTunnelControl {
+    enabled: BlockingMutex<CriticalSectionRawMutex, Cell<bool>>,
+    command: Signal<CriticalSectionRawMutex, RawTunnelCommand>,
+}
+
+impl RawTunnelControl {
+    const fn new() -> Self {
+        Self {
+            enabled: BlockingMutex::new(Cell::new(false)),
+            command: Signal::new(),
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled.lock(|enabled| enabled.get())
+    }
+
+    fn enable(&self) {
+        let changed = self.enabled.lock(|enabled| {
+            if enabled.get() {
+                false
+            } else {
+                enabled.set(true);
+                true
+            }
+        });
+        if changed {
+            self.command.signal(RawTunnelCommand::Enable);
+        }
+    }
+
+    fn disable(&self) {
+        let changed = self.enabled.lock(|enabled| {
+            if enabled.get() {
+                enabled.set(false);
+                true
+            } else {
+                false
+            }
+        });
+        if changed {
+            self.command.signal(RawTunnelCommand::Disable);
+        }
+    }
+}
+
+static RAW_TUNNEL: RawTunnelControl = RawTunnelControl::new();
+
+#[derive(Deserialize)]
+struct JsonRpcRequest<'a> {
+    jsonrpc: &'a str,
+    method: &'a str,
+    #[serde(default)]
+    params: JsonRpcParams,
+    #[serde(default)]
+    id: Option<u32>,
+}
+
+#[derive(Default, Deserialize)]
+struct JsonRpcParams {
+    #[serde(default)]
+    id: Option<u8>,
+    #[serde(default)]
+    speed: Option<u16>,
+    #[serde(default)]
+    acceleration: Option<u8>,
+    #[serde(default)]
+    direction: Option<MotorDirection>,
+    #[serde(default)]
+    position: Option<u16>,
+    #[serde(rename = "torqueLimit", default)]
+    torque_limit: Option<u16>,
+    #[serde(default)]
+    ids: Option<serde_json_core::heapless::Vec<u8, MAX_POSITION_BATCH>>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum MotorDirection {
+    Clockwise,
+    Counterclockwise,
+}
+
+enum ControllerCommand {
+    StartMotor {
+        id: u8,
+        counter_clockwise: bool,
+        speed: u16,
+        acceleration: u8,
+    },
+    StopMotor {
+        id: u8,
+    },
+    SetPosition {
+        id: u8,
+        position: u16,
+        acceleration: u8,
+        torque_limit: u16,
+    },
+    GetPosition {
+        id: u8,
+    },
+    GetPositions {
+        ids: serde_json_core::heapless::Vec<u8, MAX_POSITION_BATCH>,
+    },
+}
+
+struct PositionResult {
+    id: u8,
+    position: i16,
+}
+
+impl Serialize for PositionResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("PositionResult", 2)?;
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("position", &self.position)?;
+        state.end()
+    }
+}
+
+enum ControllerResult {
+    Ready,
+    Accepted,
+    Position(PositionResult),
+    Positions(serde_json_core::heapless::Vec<PositionResult, MAX_POSITION_BATCH>),
+    RawTunnel { active: bool },
+}
+
+impl Serialize for ControllerResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Ready => {
+                let mut state = serializer.serialize_struct("Ready", 1)?;
+                state.serialize_field("ready", &true)?;
+                state.end()
+            }
+            Self::Accepted => {
+                let mut state = serializer.serialize_struct("Accepted", 1)?;
+                state.serialize_field("accepted", &true)?;
+                state.end()
+            }
+            Self::Position(position) => position.serialize(serializer),
+            Self::Positions(positions) => {
+                let mut state = serializer.serialize_struct("Positions", 1)?;
+                state.serialize_field("positions", positions)?;
+                state.end()
+            }
+            Self::RawTunnel { active } if *active => {
+                let mut state = serializer.serialize_struct("RawTunnel", 2)?;
+                state.serialize_field("port", &RAW_TUNNEL_TCP_PORT)?;
+                state.serialize_field("active", active)?;
+                state.end()
+            }
+            Self::RawTunnel { active } => {
+                let mut state = serializer.serialize_struct("RawTunnel", 1)?;
+                state.serialize_field("active", active)?;
+                state.end()
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RpcFailure {
+    code: i32,
+    message: &'static str,
+}
+
+impl RpcFailure {
+    const PARSE_ERROR: Self = Self {
+        code: -32700,
+        message: "Parse error",
+    };
+    const INVALID_REQUEST: Self = Self {
+        code: -32600,
+        message: "Invalid Request",
+    };
+    const METHOD_NOT_FOUND: Self = Self {
+        code: -32601,
+        message: "Method not found",
+    };
+    const INVALID_PARAMS: Self = Self {
+        code: -32602,
+        message: "Invalid params",
+    };
+    const RAW_TUNNEL_ACTIVE: Self = Self {
+        code: -32010,
+        message: "Raw tunnel is active",
+    };
+    const SERVO_TIMEOUT: Self = Self {
+        code: -32001,
+        message: "STS servo timeout",
+    };
+    const SERVO_REPLY: Self = Self {
+        code: -32002,
+        message: "Invalid STS servo reply",
+    };
+    const SERVO_REPORTED_ERROR: Self = Self {
+        code: -32003,
+        message: "Servo reported STS error",
+    };
+    const SERVO_TRANSPORT: Self = Self {
+        code: -32004,
+        message: "STS UART transport failure",
+    };
+}
+
+#[derive(Serialize)]
+struct JsonRpcSuccess<'a> {
+    jsonrpc: &'static str,
+    result: &'a ControllerResult,
+    id: u32,
+}
+
+#[derive(Serialize)]
+struct JsonRpcError {
+    jsonrpc: &'static str,
+    error: JsonRpcErrorBody,
+    id: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct JsonRpcErrorBody {
+    code: i32,
+    message: &'static str,
 }
 
 #[allow(
@@ -203,7 +397,7 @@ async fn main(spawner: Spawner) -> ! {
         .with_rx(peripherals.GPIO20)
         .with_tx(peripherals.GPIO21)
         .into_async();
-    let (mut uart_rx, mut uart_tx) = uart.split();
+    let (uart_rx, uart_tx) = uart.split();
     info!(
         "servo UART ready: GPIO{SERVO_UART_RX_GPIO} RX, GPIO{SERVO_UART_TX_GPIO} TX, \
          {SERVO_UART_BAUD} baud, 8N1"
@@ -247,552 +441,713 @@ async fn main(spawner: Spawner) -> ! {
     let (stack, runner) = embassy_net::new(
         interfaces.station,
         network_config,
-        mk_static!(StackResources<3>, StackResources::<3>::new()),
+        mk_static!(StackResources<4>, StackResources::<4>::new()),
         seed,
     );
 
     spawner.spawn(wifi_connection(controller).expect("failed to allocate Wi-Fi connection task"));
     spawner.spawn(network_task(runner).expect("failed to allocate network task"));
 
-    let mut tcp_rx_buffer = [0_u8; TCP_BUFFER_SIZE];
-    let mut tcp_tx_buffer = [0_u8; TCP_BUFFER_SIZE];
-    let mut network_to_uart_buffer = [0_u8; COPY_BUFFER_SIZE];
-    let mut uart_to_network_buffer = [0_u8; COPY_BUFFER_SIZE];
-
-    loop {
-        stack.wait_config_up().await;
-        if let Some(config) = stack.config_v4() {
-            info!(
-                "Wi-Fi ready: IP {}, controller TCP port {CONTROLLER_TCP_PORT}",
-                config.address
-            );
-            show_ip_address(&mut display, config.address.address());
-            display.flush().expect("failed to update OLED");
-        }
-
-        let mut socket = TcpSocket::new(stack, &mut tcp_rx_buffer, &mut tcp_tx_buffer);
-        socket.set_nagle_enabled(false);
-        socket.set_keep_alive(Some(Duration::from_secs(10)));
-        socket.set_timeout(Some(Duration::from_secs(30)));
-
-        info!("waiting for one controller TCP client on port {CONTROLLER_TCP_PORT}");
-        if let Err(error) = socket.accept(CONTROLLER_TCP_PORT).await {
-            warn!("TCP accept failed: {error:?}");
-            Timer::after(Duration::from_secs(1)).await;
-            continue;
-        }
-
+    stack.wait_config_up().await;
+    if let Some(config) = stack.config_v4() {
         info!(
-            "controller TCP client connected: {:?}",
-            socket.remote_endpoint()
+            "Wi-Fi ready: IP {}, JSON-RPC WebSocket port {CONTROLLER_TCP_PORT}",
+            config.address
         );
-
-        match controller_session(&mut socket, &mut uart_rx, &mut uart_tx).await {
-            ControllerSessionExit::PeerClosed => {
-                info!("controller TCP client disconnected");
-            }
-            ControllerSessionExit::InvalidFrame(error) => {
-                warn!("controller TCP session ended after invalid frame: {error:?}");
-            }
-            ControllerSessionExit::DebugTunnelRequested => {
-                warn!("debug raw UART tunnel enabled for this TCP session");
-                let result = raw_tunnel(
-                    &mut socket,
-                    &mut uart_rx,
-                    &mut uart_tx,
-                    &mut network_to_uart_buffer,
-                    &mut uart_to_network_buffer,
-                )
-                .await;
-                warn!("debug raw UART tunnel stopped: {result}");
-            }
-        }
-        socket.abort();
+        show_ip_address(&mut display, config.address.address());
+        display.flush().expect("failed to update OLED");
     }
-}
 
-#[allow(
-    clippy::large_stack_frames,
-    reason = "the async controller session retains the TCP socket and UART controller futures"
-)]
-async fn controller_session(
-    socket: &mut TcpSocket<'_>,
-    uart_rx: &mut UartRx<'_, Async>,
-    uart_tx: &mut UartTx<'_, Async>,
-) -> ControllerSessionExit {
-    let mut bytes = [0_u8; FRAME_LEN];
+    let uart_rx = mk_static!(SharedUartRx, Mutex::new(uart_rx));
+    let uart_tx = mk_static!(SharedUartTx, Mutex::new(uart_tx));
+    spawner.spawn(
+        services::controller_service(stack, uart_rx, uart_tx)
+            .expect("failed to allocate JSON-RPC controller task"),
+    );
+    spawner.spawn(
+        services::raw_tunnel_service(stack, uart_rx, uart_tx)
+            .expect("failed to allocate raw tunnel task"),
+    );
+
     loop {
-        if socket.read_exact(&mut bytes).await.is_err() {
-            return ControllerSessionExit::PeerClosed;
-        }
-        let frame = match Frame::decode(bytes) {
-            Ok(frame) => frame,
-            Err(error) => return ControllerSessionExit::InvalidFrame(error),
-        };
-        let sequence = frame.sequence();
-        let command = match frame.as_command() {
-            Ok(command) => command,
-            Err(DecodeError::UnknownMessage) => {
-                if !send_controller_response(
-                    socket,
-                    sequence,
-                    Response::Error {
-                        code: ErrorCode::UnsupportedCommand,
-                        detail: 0,
-                    },
-                )
-                .await
-                {
-                    return ControllerSessionExit::PeerClosed;
-                }
+        Timer::after(Duration::from_secs(60)).await;
+    }
+}
+
+#[allow(
+    clippy::large_stack_frames,
+    reason = "controller and raw TCP task frames contain fixed, statically allocated protocol buffers"
+)]
+mod services {
+    use super::*;
+
+    #[embassy_executor::task]
+    #[allow(
+        clippy::large_stack_frames,
+        reason = "the JSON-RPC service keeps one WebSocket and its TCP buffers for its task lifetime"
+    )]
+    pub(super) async fn controller_service(
+        stack: Stack<'static>,
+        uart_rx: &'static SharedUartRx,
+        uart_tx: &'static SharedUartTx,
+    ) -> ! {
+        let mut tcp_rx_buffer = [0_u8; TCP_BUFFER_SIZE];
+        let mut tcp_tx_buffer = [0_u8; TCP_BUFFER_SIZE];
+        loop {
+            stack.wait_config_up().await;
+            let mut socket = TcpSocket::new(stack, &mut tcp_rx_buffer, &mut tcp_tx_buffer);
+            socket.set_nagle_enabled(false);
+            socket.set_keep_alive(Some(Duration::from_secs(10)));
+            socket.set_timeout(Some(Duration::from_secs(30)));
+
+            info!("waiting for JSON-RPC WebSocket client on port {CONTROLLER_TCP_PORT}");
+            if let Err(error) = socket.accept(CONTROLLER_TCP_PORT).await {
+                warn!("controller TCP accept failed: {error:?}");
+                Timer::after(Duration::from_secs(1)).await;
                 continue;
             }
-            Err(error) => {
-                if !send_controller_response(
-                    socket,
-                    sequence,
-                    Response::Error {
-                        code: ErrorCode::InvalidRequest,
-                        detail: 0,
-                    },
-                )
-                .await
-                {
-                    return ControllerSessionExit::PeerClosed;
+            info!(
+                "controller TCP client connected: {:?}",
+                socket.remote_endpoint()
+            );
+            match websocket::upgrade(&mut socket).await {
+                Ok(()) => controller_session(&mut socket, uart_rx, uart_tx).await,
+                Err(error) => warn!("rejected controller WebSocket handshake: {error:?}"),
+            }
+            socket.abort();
+        }
+    }
+
+    #[allow(
+        clippy::large_stack_frames,
+        reason = "each JSON-RPC message owns bounded request and response buffers"
+    )]
+    async fn controller_session(
+        socket: &mut TcpSocket<'_>,
+        uart_rx: &'static SharedUartRx,
+        uart_tx: &'static SharedUartTx,
+    ) {
+        let mut request_buffer = [0_u8; JSON_RPC_BUFFER_SIZE];
+        let mut response_buffer = [0_u8; JSON_RPC_BUFFER_SIZE];
+        loop {
+            let request = match websocket::read_text(socket, &mut request_buffer).await {
+                Ok(request) => request,
+                Err(websocket::Error::Closed) => {
+                    info!("controller WebSocket client disconnected");
+                    return;
                 }
-                warn!("rejected malformed controller command: {error:?}");
+                Err(error) => {
+                    warn!("controller WebSocket session ended: {error:?}");
+                    return;
+                }
+            };
+            let Some(response_len) =
+                handle_json_rpc(request, &mut response_buffer, uart_rx, uart_tx).await
+            else {
                 continue;
+            };
+            if let Err(error) =
+                websocket::write_text(socket, &response_buffer[..response_len]).await
+            {
+                warn!("could not send JSON-RPC response: {error:?}");
+                return;
+            }
+        }
+    }
+
+    #[allow(
+        clippy::large_stack_frames,
+        reason = "a controller command keeps MCU-local STS transaction futures alive"
+    )]
+    async fn handle_json_rpc(
+        text: &str,
+        response: &mut [u8],
+        uart_rx: &'static SharedUartRx,
+        uart_tx: &'static SharedUartTx,
+    ) -> Option<usize> {
+        let request = match serde_json_core::from_slice::<JsonRpcRequest<'_>>(text.as_bytes()) {
+            Ok((request, _)) => request,
+            Err(_) => return encode_error(response, None, RpcFailure::PARSE_ERROR),
+        };
+        if request.jsonrpc != "2.0" {
+            return encode_error(response, request.id, RpcFailure::INVALID_REQUEST);
+        }
+
+        let result = match request.method {
+            "system.ping" => Ok(ControllerResult::Ready),
+            "debug.enableRawTunnel" => {
+                RAW_TUNNEL.enable();
+                Ok(ControllerResult::RawTunnel { active: true })
+            }
+            "debug.disableRawTunnel" => {
+                RAW_TUNNEL.disable();
+                Ok(ControllerResult::RawTunnel { active: false })
+            }
+            method => {
+                if RAW_TUNNEL.is_enabled() {
+                    Err(RpcFailure::RAW_TUNNEL_ACTIVE)
+                } else {
+                    match command_from_request(method, request.params) {
+                        Ok(command) => execute_command(command, uart_rx, uart_tx)
+                            .await
+                            .map_err(ServoFailure::rpc_failure),
+                        Err(error) => Err(error),
+                    }
+                }
             }
         };
 
-        if matches!(command, Command::OpenRawTunnel) {
-            if send_controller_response(socket, sequence, Response::RawTunnelReady).await {
-                return ControllerSessionExit::DebugTunnelRequested;
+        let id = request.id?;
+        match result {
+            Ok(result) => encode_success(response, id, &result),
+            Err(error) => encode_error(response, Some(id), error),
+        }
+    }
+
+    fn command_from_request(
+        method: &str,
+        params: JsonRpcParams,
+    ) -> Result<ControllerCommand, RpcFailure> {
+        match method {
+            "motor.start" => Ok(ControllerCommand::StartMotor {
+                id: params.id.ok_or(RpcFailure::INVALID_PARAMS)?,
+                counter_clockwise: matches!(
+                    params.direction.ok_or(RpcFailure::INVALID_PARAMS)?,
+                    MotorDirection::Counterclockwise
+                ),
+                speed: params.speed.ok_or(RpcFailure::INVALID_PARAMS)?,
+                acceleration: params.acceleration.ok_or(RpcFailure::INVALID_PARAMS)?,
+            }),
+            "motor.stop" => Ok(ControllerCommand::StopMotor {
+                id: params.id.ok_or(RpcFailure::INVALID_PARAMS)?,
+            }),
+            "servo.setPosition" => Ok(ControllerCommand::SetPosition {
+                id: params.id.ok_or(RpcFailure::INVALID_PARAMS)?,
+                position: params.position.ok_or(RpcFailure::INVALID_PARAMS)?,
+                acceleration: params.acceleration.ok_or(RpcFailure::INVALID_PARAMS)?,
+                torque_limit: params.torque_limit.ok_or(RpcFailure::INVALID_PARAMS)?,
+            }),
+            "servo.getPosition" => Ok(ControllerCommand::GetPosition {
+                id: params.id.ok_or(RpcFailure::INVALID_PARAMS)?,
+            }),
+            "servo.getPositions" => Ok(ControllerCommand::GetPositions {
+                ids: params.ids.ok_or(RpcFailure::INVALID_PARAMS)?,
+            }),
+            _ => Err(RpcFailure::METHOD_NOT_FOUND),
+        }
+    }
+
+    #[allow(
+        clippy::large_stack_frames,
+        reason = "a controller command owns bounded RPC results and local STS transaction futures"
+    )]
+    async fn execute_command(
+        command: ControllerCommand,
+        uart_rx: &'static SharedUartRx,
+        uart_tx: &'static SharedUartTx,
+    ) -> Result<ControllerResult, ServoFailure> {
+        let mut uart_rx = uart_rx.lock().await;
+        let mut uart_tx = uart_tx.lock().await;
+        let result = match command {
+            ControllerCommand::StartMotor {
+                id,
+                counter_clockwise,
+                speed,
+                acceleration,
+            } => start_motor(
+                &mut uart_rx,
+                &mut uart_tx,
+                id,
+                counter_clockwise,
+                speed,
+                acceleration,
+            )
+            .await
+            .map(|()| ControllerResult::Accepted),
+            ControllerCommand::StopMotor { id } => stop_motor(&mut uart_rx, &mut uart_tx, id)
+                .await
+                .map(|()| ControllerResult::Accepted),
+            ControllerCommand::SetPosition {
+                id,
+                position,
+                acceleration,
+                torque_limit,
+            } => move_position(
+                &mut uart_rx,
+                &mut uart_tx,
+                id,
+                position,
+                acceleration,
+                torque_limit,
+            )
+            .await
+            .map(|()| ControllerResult::Accepted),
+            ControllerCommand::GetPosition { id } => read_position(&mut uart_rx, &mut uart_tx, id)
+                .await
+                .map(|position| ControllerResult::Position(PositionResult { id, position })),
+            ControllerCommand::GetPositions { ids } => {
+                read_positions(&mut uart_rx, &mut uart_tx, ids)
+                    .await
+                    .map(ControllerResult::Positions)
             }
-            return ControllerSessionExit::PeerClosed;
+        };
+        if result.is_err() {
+            warn!("local STS command failed; draining UART before continuing");
+            resynchronize_uart(&mut uart_rx).await;
         }
+        result
+    }
 
-        let response = execute_command(command, uart_rx, uart_tx).await;
-        if !send_controller_response(socket, sequence, response).await {
-            return ControllerSessionExit::PeerClosed;
-        }
-    }
-}
-
-async fn send_controller_response(
-    socket: &mut TcpSocket<'_>,
-    sequence: u32,
-    response: Response,
-) -> bool {
-    let bytes = Frame::response(sequence, response).encode();
-    socket.write_all(&bytes).await.is_ok()
-}
-
-#[allow(
-    clippy::large_stack_frames,
-    reason = "each controller command retains local STS UART transaction futures"
-)]
-async fn execute_command(
-    command: Command,
-    uart_rx: &mut UartRx<'_, Async>,
-    uart_tx: &mut UartTx<'_, Async>,
-) -> Response {
-    let result = match command {
-        Command::Ping => Ok(Response::Ack),
-        Command::StartMotor {
-            id,
-            counter_clockwise,
-            speed,
-            acceleration,
-        } => start_motor(uart_rx, uart_tx, id, counter_clockwise, speed, acceleration)
-            .await
-            .map(|()| Response::Ack),
-        Command::StopMotor { id } => stop_motor(uart_rx, uart_tx, id)
-            .await
-            .map(|()| Response::Ack),
-        Command::SetPosition {
-            id,
-            position,
-            acceleration,
-            torque_limit,
-        } => move_position(uart_rx, uart_tx, id, position, acceleration, torque_limit)
-            .await
-            .map(|()| Response::Ack),
-        Command::ReadPosition { id } => read_position(uart_rx, uart_tx, id)
-            .await
-            .map(|position| Response::Position { id, position }),
-        Command::OpenRawTunnel => unreachable!("debug tunnel is handled before serial execution"),
-    };
-    match result {
-        Ok(response) => response,
-        Err(error) => {
-            warn!("local STS command failed: {error:?}; draining UART before continuing");
-            resynchronize_uart(uart_rx).await;
-            error.response()
-        }
-    }
-}
-
-#[allow(
-    clippy::large_stack_frames,
-    reason = "the local STS write sequence retains UART transaction futures"
-)]
-async fn start_motor(
-    uart_rx: &mut UartRx<'_, Async>,
-    uart_tx: &mut UartTx<'_, Async>,
-    id: u8,
-    counter_clockwise: bool,
-    speed: u16,
-    acceleration: u8,
-) -> Result<(), ServoFailure> {
-    validate_servo_id(id)?;
-    if speed > 4095 {
-        return Err(ServoFailure::InvalidArgument);
-    }
-    write_register(uart_rx, uart_tx, id, STS_MODE, &[1]).await?;
-    write_register(uart_rx, uart_tx, id, STS_TORQUE_ENABLE, &[1]).await?;
-    let signed_speed = if counter_clockwise {
-        speed | 0x8000
-    } else {
-        speed
-    };
-    let mut command = [0_u8; 7];
-    command[0] = acceleration;
-    command[5..7].copy_from_slice(&signed_speed.to_le_bytes());
-    write_register(uart_rx, uart_tx, id, STS_ACCELERATION, &command).await
-}
-
-async fn stop_motor(
-    uart_rx: &mut UartRx<'_, Async>,
-    uart_tx: &mut UartTx<'_, Async>,
-    id: u8,
-) -> Result<(), ServoFailure> {
-    validate_servo_id(id)?;
-    write_register(uart_rx, uart_tx, id, STS_ACCELERATION, &[0; 7]).await
-}
-
-#[allow(
-    clippy::large_stack_frames,
-    reason = "the local STS write sequence retains UART transaction futures"
-)]
-async fn move_position(
-    uart_rx: &mut UartRx<'_, Async>,
-    uart_tx: &mut UartTx<'_, Async>,
-    id: u8,
-    position: u16,
-    acceleration: u8,
-    torque_limit: u16,
-) -> Result<(), ServoFailure> {
-    validate_servo_id(id)?;
-    if position > 4095 || torque_limit > 1000 {
-        return Err(ServoFailure::InvalidArgument);
-    }
-    write_register(uart_rx, uart_tx, id, STS_TORQUE_ENABLE, &[1]).await?;
-    write_register(
-        uart_rx,
-        uart_tx,
-        id,
-        STS_TORQUE_LIMIT,
-        &torque_limit.to_le_bytes(),
-    )
-    .await?;
-    let mut command = [0_u8; 7];
-    command[0] = acceleration;
-    command[1..3].copy_from_slice(&position.to_le_bytes());
-    write_register(uart_rx, uart_tx, id, STS_ACCELERATION, &command).await
-}
-
-#[allow(
-    clippy::large_stack_frames,
-    reason = "the local STS read retains the UART response parser future"
-)]
-async fn read_position(
-    uart_rx: &mut UartRx<'_, Async>,
-    uart_tx: &mut UartTx<'_, Async>,
-    id: u8,
-) -> Result<i16, ServoFailure> {
-    validate_servo_id(id)?;
-    let status = send_sts_packet(
-        uart_rx,
-        uart_tx,
-        id,
-        STS_INSTRUCTION_READ,
-        &[STS_PRESENT_POSITION, 2],
-    )
-    .await?;
-    if status.payload_len != 2 {
-        return Err(ServoFailure::InvalidReply);
-    }
-    let value = u16::from_le_bytes([status.payload[0], status.payload[1]]);
-    Ok(decode_signed_15(value))
-}
-
-#[allow(
-    clippy::large_stack_frames,
-    reason = "the local STS write retains the UART transaction future"
-)]
-async fn write_register(
-    uart_rx: &mut UartRx<'_, Async>,
-    uart_tx: &mut UartTx<'_, Async>,
-    id: u8,
-    address: u8,
-    data: &[u8],
-) -> Result<(), ServoFailure> {
-    let mut parameters = [0_u8; 8];
-    if data.len() > parameters.len() - 1 {
-        return Err(ServoFailure::InvalidArgument);
-    }
-    parameters[0] = address;
-    parameters[1..=data.len()].copy_from_slice(data);
-    let status = send_sts_packet(
-        uart_rx,
-        uart_tx,
-        id,
-        STS_INSTRUCTION_WRITE,
-        &parameters[..=data.len()],
-    )
-    .await?;
-    if status.payload_len == 0 {
-        Ok(())
-    } else {
-        Err(ServoFailure::InvalidReply)
-    }
-}
-
-struct StsStatus {
-    payload: [u8; 64],
-    payload_len: usize,
-}
-
-#[allow(
-    clippy::large_stack_frames,
-    reason = "the local STS transaction retains UART I/O and timeout futures"
-)]
-async fn send_sts_packet(
-    uart_rx: &mut UartRx<'_, Async>,
-    uart_tx: &mut UartTx<'_, Async>,
-    id: u8,
-    instruction: u8,
-    parameters: &[u8],
-) -> Result<StsStatus, ServoFailure> {
-    let length = parameters
-        .len()
-        .checked_add(2)
-        .ok_or(ServoFailure::InvalidArgument)?;
-    let length = u8::try_from(length).map_err(|_| ServoFailure::InvalidArgument)?;
-    let mut packet = [0_u8; 16];
-    let packet_len = parameters.len() + 6;
-    if packet_len > packet.len() {
-        return Err(ServoFailure::InvalidArgument);
-    }
-    packet[..2].copy_from_slice(&STS_HEADER);
-    packet[2] = id;
-    packet[3] = length;
-    packet[4] = instruction;
-    packet[5..5 + parameters.len()].copy_from_slice(parameters);
-    packet[packet_len - 1] = checksum(&packet[2..packet_len - 1]);
-    uart_tx
-        .write_all(&packet[..packet_len])
-        .await
-        .map_err(|_| ServoFailure::Transport)?;
-
-    match with_timeout(STS_RESPONSE_TIMEOUT, read_sts_status(uart_rx, id)).await {
-        Ok(result) => result,
-        Err(_) => Err(ServoFailure::Timeout),
-    }
-}
-
-#[allow(
-    clippy::large_stack_frames,
-    reason = "the local STS status parser retains UART read futures"
-)]
-async fn read_sts_status(
-    uart_rx: &mut UartRx<'_, Async>,
-    expected_id: u8,
-) -> Result<StsStatus, ServoFailure> {
-    let mut previous = 0_u8;
-    let mut found_header = false;
-    for _ in 0..128 {
-        let byte = read_uart_byte(uart_rx).await?;
-        if previous == 0xff && byte == 0xff {
-            found_header = true;
-            break;
-        }
-        previous = byte;
-    }
-    if !found_header {
-        return Err(ServoFailure::InvalidReply);
-    }
-    let id = read_uart_byte(uart_rx).await?;
-    let length = read_uart_byte(uart_rx).await? as usize;
-    if id != expected_id || !(2..=66).contains(&length) {
-        return Err(ServoFailure::InvalidReply);
-    }
-    let error = read_uart_byte(uart_rx).await?;
-    let payload_len = length - 2;
-    let mut payload = [0_u8; 64];
-    for byte in &mut payload[..payload_len] {
-        *byte = read_uart_byte(uart_rx).await?;
-    }
-    let received_checksum = read_uart_byte(uart_rx).await?;
-    let mut checksum_bytes = [0_u8; 66];
-    checksum_bytes[0] = error;
-    checksum_bytes[1..1 + payload_len].copy_from_slice(&payload[..payload_len]);
-    if received_checksum != status_checksum(id, length as u8, &checksum_bytes[..1 + payload_len]) {
-        return Err(ServoFailure::InvalidReply);
-    }
-    if error != 0 {
-        return Err(ServoFailure::ReportedError(error));
-    }
-    Ok(StsStatus {
-        payload,
-        payload_len,
-    })
-}
-
-async fn read_uart_byte(uart_rx: &mut UartRx<'_, Async>) -> Result<u8, ServoFailure> {
-    let mut byte = [0_u8; 1];
-    uart_rx
-        .read_async(&mut byte)
-        .await
-        .map_err(|_| ServoFailure::Transport)?;
-    Ok(byte[0])
-}
-
-async fn resynchronize_uart(uart_rx: &mut UartRx<'_, Async>) {
-    // `read_async` is cancellation-safe in esp-hal.  Waiting for a short quiet
-    // interval and discarding any trailing bytes prevents an old STS response
-    // from being associated with the next local command.
-    let mut discarded = [0_u8; 64];
-    for _ in 0..4 {
-        if with_timeout(Duration::from_millis(2), uart_rx.read_async(&mut discarded))
-            .await
-            .is_err()
-        {
-            break;
-        }
-    }
-}
-
-const fn validate_servo_id(id: u8) -> Result<(), ServoFailure> {
-    if id == 0 || id == STS_BROADCAST_ID || id == u8::MAX {
-        Err(ServoFailure::InvalidServoId)
-    } else {
-        Ok(())
-    }
-}
-
-const fn checksum(bytes: &[u8]) -> u8 {
-    let mut sum = 0_u8;
-    let mut index = 0;
-    while index < bytes.len() {
-        sum = sum.wrapping_add(bytes[index]);
-        index += 1;
-    }
-    !sum
-}
-
-const fn status_checksum(id: u8, length: u8, bytes: &[u8]) -> u8 {
-    let mut sum = id.wrapping_add(length);
-    let mut index = 0;
-    while index < bytes.len() {
-        sum = sum.wrapping_add(bytes[index]);
-        index += 1;
-    }
-    !sum
-}
-
-const fn decode_signed_15(value: u16) -> i16 {
-    if value & 0x8000 != 0 {
-        -((value & 0x7fff) as i16)
-    } else {
-        value as i16
-    }
-}
-
-#[allow(
-    clippy::large_stack_frames,
-    reason = "the debug tunnel retains both TCP-to-UART forwarding futures"
-)]
-async fn raw_tunnel(
-    socket: &mut TcpSocket<'_>,
-    uart_rx: &mut UartRx<'_, Async>,
-    uart_tx: &mut UartTx<'_, Async>,
-    network_to_uart_buffer: &mut [u8],
-    uart_to_network_buffer: &mut [u8],
-) -> BridgeExit {
-    let (mut tcp_rx, mut tcp_tx) = socket.split();
-    match select(
-        forward(
-            &mut tcp_rx,
-            uart_tx,
-            network_to_uart_buffer,
-            CopyDirection::NetworkToUart,
-        ),
-        forward(
-            uart_rx,
-            &mut tcp_tx,
-            uart_to_network_buffer,
-            CopyDirection::UartToNetwork,
-        ),
-    )
-    .await
+    #[allow(
+        clippy::large_stack_frames,
+        reason = "the bounded six-servo result contains local STS parser futures"
+    )]
+    async fn read_positions(
+        uart_rx: &mut UartRx<'_, Async>,
+        uart_tx: &mut UartTx<'_, Async>,
+        ids: serde_json_core::heapless::Vec<u8, MAX_POSITION_BATCH>,
+    ) -> Result<serde_json_core::heapless::Vec<PositionResult, MAX_POSITION_BATCH>, ServoFailure>
     {
-        Either::First(result) | Either::Second(result) => result,
+        let mut positions = serde_json_core::heapless::Vec::new();
+        for id in ids {
+            let position = read_position(uart_rx, uart_tx, id).await?;
+            positions
+                .push(PositionResult { id, position })
+                .map_err(|_| ServoFailure::InvalidArgument)?;
+        }
+        Ok(positions)
     }
-}
 
-#[allow(
-    clippy::large_stack_frames,
-    reason = "the async UART/TCP driver futures retain peripheral state across await points"
-)]
-async fn forward<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    buffer: &mut [u8],
-    direction: CopyDirection,
-) -> BridgeExit
-where
-    R: Read,
-    R::Error: fmt::Debug,
-    W: Write,
-    W::Error: fmt::Debug,
-{
-    let mut consecutive_read_errors = 0_u32;
-    let mut forwarding_started = false;
+    fn encode_success(response: &mut [u8], id: u32, result: &ControllerResult) -> Option<usize> {
+        serde_json_core::to_slice(
+            &JsonRpcSuccess {
+                jsonrpc: "2.0",
+                result,
+                id,
+            },
+            response,
+        )
+        .ok()
+    }
 
-    loop {
-        let count = match reader.read(buffer).await {
-            Ok(0) => return BridgeExit::InputClosed(direction),
-            Ok(count) => {
-                consecutive_read_errors = 0;
-                count
+    fn encode_error(response: &mut [u8], id: Option<u32>, failure: RpcFailure) -> Option<usize> {
+        serde_json_core::to_slice(
+            &JsonRpcError {
+                jsonrpc: "2.0",
+                error: JsonRpcErrorBody {
+                    code: failure.code,
+                    message: failure.message,
+                },
+                id,
+            },
+            response,
+        )
+        .ok()
+    }
+
+    #[allow(
+        clippy::large_stack_frames,
+        reason = "the local STS write sequence retains UART transaction futures"
+    )]
+    async fn start_motor(
+        uart_rx: &mut UartRx<'_, Async>,
+        uart_tx: &mut UartTx<'_, Async>,
+        id: u8,
+        counter_clockwise: bool,
+        speed: u16,
+        acceleration: u8,
+    ) -> Result<(), ServoFailure> {
+        validate_servo_id(id)?;
+        if speed > 4095 {
+            return Err(ServoFailure::InvalidArgument);
+        }
+        write_register(uart_rx, uart_tx, id, STS_MODE, &[1]).await?;
+        write_register(uart_rx, uart_tx, id, STS_TORQUE_ENABLE, &[1]).await?;
+        let signed_speed = if counter_clockwise {
+            speed | 0x8000
+        } else {
+            speed
+        };
+        let mut command = [0_u8; 7];
+        command[0] = acceleration;
+        command[5..7].copy_from_slice(&signed_speed.to_le_bytes());
+        write_register(uart_rx, uart_tx, id, STS_ACCELERATION, &command).await
+    }
+
+    async fn stop_motor(
+        uart_rx: &mut UartRx<'_, Async>,
+        uart_tx: &mut UartTx<'_, Async>,
+        id: u8,
+    ) -> Result<(), ServoFailure> {
+        validate_servo_id(id)?;
+        write_register(uart_rx, uart_tx, id, STS_ACCELERATION, &[0; 7]).await
+    }
+
+    #[allow(
+        clippy::large_stack_frames,
+        reason = "the local STS write sequence retains UART transaction futures"
+    )]
+    async fn move_position(
+        uart_rx: &mut UartRx<'_, Async>,
+        uart_tx: &mut UartTx<'_, Async>,
+        id: u8,
+        position: u16,
+        acceleration: u8,
+        torque_limit: u16,
+    ) -> Result<(), ServoFailure> {
+        validate_servo_id(id)?;
+        if position > 4095 || torque_limit > 1000 {
+            return Err(ServoFailure::InvalidArgument);
+        }
+        write_register(uart_rx, uart_tx, id, STS_TORQUE_ENABLE, &[1]).await?;
+        write_register(
+            uart_rx,
+            uart_tx,
+            id,
+            STS_TORQUE_LIMIT,
+            &torque_limit.to_le_bytes(),
+        )
+        .await?;
+        let mut command = [0_u8; 7];
+        command[0] = acceleration;
+        command[1..3].copy_from_slice(&position.to_le_bytes());
+        write_register(uart_rx, uart_tx, id, STS_ACCELERATION, &command).await
+    }
+
+    #[allow(
+        clippy::large_stack_frames,
+        reason = "the local STS read retains the UART response parser future"
+    )]
+    async fn read_position(
+        uart_rx: &mut UartRx<'_, Async>,
+        uart_tx: &mut UartTx<'_, Async>,
+        id: u8,
+    ) -> Result<i16, ServoFailure> {
+        validate_servo_id(id)?;
+        let status = send_sts_packet(
+            uart_rx,
+            uart_tx,
+            id,
+            STS_INSTRUCTION_READ,
+            &[STS_PRESENT_POSITION, 2],
+        )
+        .await?;
+        if status.payload_len != 2 {
+            return Err(ServoFailure::InvalidReply);
+        }
+        let value = u16::from_le_bytes([status.payload[0], status.payload[1]]);
+        Ok(decode_signed_15(value))
+    }
+
+    #[allow(
+        clippy::large_stack_frames,
+        reason = "the local STS write retains the UART transaction future"
+    )]
+    async fn write_register(
+        uart_rx: &mut UartRx<'_, Async>,
+        uart_tx: &mut UartTx<'_, Async>,
+        id: u8,
+        address: u8,
+        data: &[u8],
+    ) -> Result<(), ServoFailure> {
+        let mut parameters = [0_u8; 8];
+        if data.len() > parameters.len() - 1 {
+            return Err(ServoFailure::InvalidArgument);
+        }
+        parameters[0] = address;
+        parameters[1..=data.len()].copy_from_slice(data);
+        let status = send_sts_packet(
+            uart_rx,
+            uart_tx,
+            id,
+            STS_INSTRUCTION_WRITE,
+            &parameters[..=data.len()],
+        )
+        .await?;
+        if status.payload_len == 0 {
+            Ok(())
+        } else {
+            Err(ServoFailure::InvalidReply)
+        }
+    }
+
+    struct StsStatus {
+        payload: [u8; 64],
+        payload_len: usize,
+    }
+
+    #[allow(
+        clippy::large_stack_frames,
+        reason = "the local STS transaction retains UART I/O and timeout futures"
+    )]
+    async fn send_sts_packet(
+        uart_rx: &mut UartRx<'_, Async>,
+        uart_tx: &mut UartTx<'_, Async>,
+        id: u8,
+        instruction: u8,
+        parameters: &[u8],
+    ) -> Result<StsStatus, ServoFailure> {
+        let length = parameters
+            .len()
+            .checked_add(2)
+            .ok_or(ServoFailure::InvalidArgument)?;
+        let length = u8::try_from(length).map_err(|_| ServoFailure::InvalidArgument)?;
+        let mut packet = [0_u8; 16];
+        let packet_len = parameters.len() + 6;
+        if packet_len > packet.len() {
+            return Err(ServoFailure::InvalidArgument);
+        }
+        packet[..2].copy_from_slice(&STS_HEADER);
+        packet[2] = id;
+        packet[3] = length;
+        packet[4] = instruction;
+        packet[5..5 + parameters.len()].copy_from_slice(parameters);
+        packet[packet_len - 1] = checksum(&packet[2..packet_len - 1]);
+        uart_tx
+            .write_all(&packet[..packet_len])
+            .await
+            .map_err(|_| ServoFailure::Transport)?;
+
+        match with_timeout(STS_RESPONSE_TIMEOUT, read_sts_status(uart_rx, id)).await {
+            Ok(result) => result,
+            Err(_) => Err(ServoFailure::Timeout),
+        }
+    }
+
+    #[allow(
+        clippy::large_stack_frames,
+        reason = "the local STS status parser retains UART read futures"
+    )]
+    async fn read_sts_status(
+        uart_rx: &mut UartRx<'_, Async>,
+        expected_id: u8,
+    ) -> Result<StsStatus, ServoFailure> {
+        let mut previous = 0_u8;
+        let mut found_header = false;
+        for _ in 0..128 {
+            let byte = read_uart_byte(uart_rx).await?;
+            if previous == 0xff && byte == 0xff {
+                found_header = true;
+                break;
             }
-            Err(error) if matches!(direction, CopyDirection::UartToNetwork) => {
-                consecutive_read_errors = consecutive_read_errors.saturating_add(1);
-                if consecutive_read_errors <= 3 || consecutive_read_errors.is_power_of_two() {
-                    warn!(
-                        "servo UART RX error: {error:?} (consecutive: \
-                         {consecutive_read_errors}); keeping TCP client connected"
-                    );
-                }
-                Timer::after(Duration::from_millis(10)).await;
+            previous = byte;
+        }
+        if !found_header {
+            return Err(ServoFailure::InvalidReply);
+        }
+        let id = read_uart_byte(uart_rx).await?;
+        let length = read_uart_byte(uart_rx).await? as usize;
+        if id != expected_id || !(2..=66).contains(&length) {
+            return Err(ServoFailure::InvalidReply);
+        }
+        let error = read_uart_byte(uart_rx).await?;
+        let payload_len = length - 2;
+        let mut payload = [0_u8; 64];
+        for byte in &mut payload[..payload_len] {
+            *byte = read_uart_byte(uart_rx).await?;
+        }
+        let received_checksum = read_uart_byte(uart_rx).await?;
+        let mut checksum_bytes = [0_u8; 66];
+        checksum_bytes[0] = error;
+        checksum_bytes[1..1 + payload_len].copy_from_slice(&payload[..payload_len]);
+        if received_checksum
+            != status_checksum(id, length as u8, &checksum_bytes[..1 + payload_len])
+        {
+            return Err(ServoFailure::InvalidReply);
+        }
+        if error != 0 {
+            return Err(ServoFailure::ReportedError);
+        }
+        Ok(StsStatus {
+            payload,
+            payload_len,
+        })
+    }
+
+    async fn read_uart_byte(uart_rx: &mut UartRx<'_, Async>) -> Result<u8, ServoFailure> {
+        let mut byte = [0_u8; 1];
+        uart_rx
+            .read_async(&mut byte)
+            .await
+            .map_err(|_| ServoFailure::Transport)?;
+        Ok(byte[0])
+    }
+
+    async fn resynchronize_uart(uart_rx: &mut UartRx<'_, Async>) {
+        // `read_async` is cancellation-safe in esp-hal.  Waiting for a short quiet
+        // interval and discarding any trailing bytes prevents an old STS response
+        // from being associated with the next local command.
+        let mut discarded = [0_u8; 64];
+        for _ in 0..4 {
+            if with_timeout(Duration::from_millis(2), uart_rx.read_async(&mut discarded))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
+
+    const fn validate_servo_id(id: u8) -> Result<(), ServoFailure> {
+        if id == 0 || id == STS_BROADCAST_ID || id == u8::MAX {
+            Err(ServoFailure::InvalidServoId)
+        } else {
+            Ok(())
+        }
+    }
+
+    const fn checksum(bytes: &[u8]) -> u8 {
+        let mut sum = 0_u8;
+        let mut index = 0;
+        while index < bytes.len() {
+            sum = sum.wrapping_add(bytes[index]);
+            index += 1;
+        }
+        !sum
+    }
+
+    const fn status_checksum(id: u8, length: u8, bytes: &[u8]) -> u8 {
+        let mut sum = id.wrapping_add(length);
+        let mut index = 0;
+        while index < bytes.len() {
+            sum = sum.wrapping_add(bytes[index]);
+            index += 1;
+        }
+        !sum
+    }
+
+    const fn decode_signed_15(value: u16) -> i16 {
+        if value & 0x8000 != 0 {
+            -((value & 0x7fff) as i16)
+        } else {
+            value as i16
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RawClientExit {
+        ClientClosed,
+        Disabled,
+        NetworkError,
+    }
+
+    #[embassy_executor::task]
+    #[allow(
+        clippy::large_stack_frames,
+        reason = "the raw listener keeps a separate TCP socket and bounded forwarding buffers"
+    )]
+    pub(super) async fn raw_tunnel_service(
+        stack: Stack<'static>,
+        uart_rx: &'static SharedUartRx,
+        uart_tx: &'static SharedUartTx,
+    ) -> ! {
+        let mut tcp_rx_buffer = [0_u8; TCP_BUFFER_SIZE];
+        let mut tcp_tx_buffer = [0_u8; TCP_BUFFER_SIZE];
+        loop {
+            if !RAW_TUNNEL.is_enabled() {
+                RAW_TUNNEL.command.wait().await;
                 continue;
             }
-            Err(error) => {
-                warn!("{direction} read error: {error:?}");
-                return BridgeExit::ReadError(direction);
+
+            stack.wait_config_up().await;
+            let mut socket = TcpSocket::new(stack, &mut tcp_rx_buffer, &mut tcp_tx_buffer);
+            socket.set_nagle_enabled(false);
+            socket.set_keep_alive(Some(Duration::from_secs(10)));
+            socket.set_timeout(None);
+            info!("raw UART debug tunnel listening on port {RAW_TUNNEL_TCP_PORT}");
+
+            match select(
+                RAW_TUNNEL.command.wait(),
+                socket.accept(RAW_TUNNEL_TCP_PORT),
+            )
+            .await
+            {
+                Either::First(RawTunnelCommand::Disable) => {
+                    socket.abort();
+                    info!("raw UART debug tunnel disabled before a client connected");
+                }
+                Either::First(RawTunnelCommand::Enable) => {
+                    socket.abort();
+                }
+                Either::Second(Ok(())) => {
+                    info!("raw UART client connected: {:?}", socket.remote_endpoint());
+                    let exit = raw_client_session(&mut socket, uart_rx, uart_tx).await;
+                    socket.abort();
+                    match exit {
+                        RawClientExit::ClientClosed => {
+                            info!("raw UART client disconnected; tunnel remains enabled");
+                        }
+                        RawClientExit::Disabled => {
+                            info!("raw UART tunnel disabled while its client was connected");
+                        }
+                        RawClientExit::NetworkError => {
+                            warn!("raw UART client connection failed; tunnel remains enabled");
+                        }
+                    }
+                }
+                Either::Second(Err(error)) => {
+                    warn!("raw tunnel TCP accept failed: {error:?}");
+                    socket.abort();
+                    Timer::after(Duration::from_secs(1)).await;
+                }
             }
-        };
-
-        if let Err(error) = writer.write_all(&buffer[..count]).await {
-            warn!("{direction} write error: {error:?}");
-            return BridgeExit::WriteError(direction);
         }
+    }
 
-        if !forwarding_started {
-            info!("{direction} forwarding started with {count} bytes");
-            forwarding_started = true;
+    #[allow(
+        clippy::large_stack_frames,
+        reason = "raw forwarding owns bounded network and UART buffers while a client is connected"
+    )]
+    async fn raw_client_session(
+        socket: &mut TcpSocket<'_>,
+        uart_rx: &'static SharedUartRx,
+        uart_tx: &'static SharedUartTx,
+    ) -> RawClientExit {
+        let mut network_to_uart = [0_u8; COPY_BUFFER_SIZE];
+        let mut uart_to_network = [0_u8; COPY_BUFFER_SIZE];
+        let mut uart_read_errors = 0_u32;
+        loop {
+            let uart_read = async {
+                let mut uart_rx = uart_rx.lock().await;
+                uart_rx.read_async(&mut uart_to_network).await
+            };
+            match select3(
+                RAW_TUNNEL.command.wait(),
+                socket.read(&mut network_to_uart),
+                uart_read,
+            )
+            .await
+            {
+                Either3::First(RawTunnelCommand::Disable) => return RawClientExit::Disabled,
+                Either3::First(RawTunnelCommand::Enable) => continue,
+                Either3::Second(Ok(0)) => return RawClientExit::ClientClosed,
+                Either3::Second(Ok(count)) => {
+                    let mut uart_tx = uart_tx.lock().await;
+                    if uart_tx.write_all(&network_to_uart[..count]).await.is_err() {
+                        return RawClientExit::NetworkError;
+                    }
+                }
+                Either3::Second(Err(error)) => {
+                    warn!("raw tunnel TCP read error: {error:?}");
+                    return RawClientExit::NetworkError;
+                }
+                Either3::Third(Ok(0)) => continue,
+                Either3::Third(Ok(count)) => {
+                    uart_read_errors = 0;
+                    if socket.write_all(&uart_to_network[..count]).await.is_err() {
+                        return RawClientExit::NetworkError;
+                    }
+                }
+                Either3::Third(Err(error)) => {
+                    uart_read_errors = uart_read_errors.saturating_add(1);
+                    if uart_read_errors <= 3 || uart_read_errors.is_power_of_two() {
+                        warn!(
+                            "servo UART RX error during raw tunnel: {error:?} (consecutive: {uart_read_errors})"
+                        );
+                    }
+                    Timer::after(Duration::from_millis(10)).await;
+                }
+            }
         }
     }
 }

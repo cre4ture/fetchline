@@ -22,7 +22,8 @@ host address="0.0.0.0:8787":
 host-debug address="0.0.0.0:8787":
     FETCHLINE_LOG=debug cargo run --manifest-path host/Cargo.toml --target "{{host_target}}" --release --bin fetchline-host -- "{{address}}"
 
-# Testing only: have the MCU enter its raw STS UART tunnel for this host session.
+# Testing only: enable the MCU raw STS listener on port 3334, then connect this host to it.
+# The listener remains active after this host disconnects until debug.disableRawTunnel is sent.
 host-debug-tunnel address="0.0.0.0:8787":
     FETCHLINE_LOG=debug cargo run --manifest-path host/Cargo.toml --target "{{host_target}}" --release --bin fetchline-host -- --debug-raw-tunnel "{{address}}"
 

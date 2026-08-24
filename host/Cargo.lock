@@ -153,11 +153,13 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "fetchline-protocol",
+ "futures-util",
  "log",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tower",
 ]
 

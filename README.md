@@ -11,7 +11,7 @@ Browser <-> Linux host <-> controller API / Wi-Fi <-> ESP32-C3 <-> UART1 <-> FE-
 ```
 
 The MCU owns the UART transaction, local response deadline, and recovery from
-late STS replies. Wi-Fi carries only controller requests and sequenced results,
+late STS replies. Wi-Fi carries only controller requests and JSON-RPC results,
 so a delayed network packet cannot be mistaken for a later servo response.
 
 ## Linux host control panel
@@ -67,9 +67,9 @@ just host-logs
 The normal log records host startup, browser WebSocket connect/disconnect,
 MCU controller-API connection attempts and failures, and every servo action
 with its elapsed time. The MCU reports local STS timeouts, invalid replies, and
-servo errors as structured controller results. Delayed API responses carry a
-sequence number and are discarded by the host rather than being associated with
-a later action. For controller-frame diagnostics, start the panel with:
+servo errors as structured JSON-RPC errors. Delayed API responses carry a
+JSON-RPC request ID and are discarded by the host rather than being associated
+with a later action. For controller diagnostics, start the panel with:
 
 ```sh
 just host-debug
@@ -85,18 +85,27 @@ actuators. Keep it on a trusted LAN, or firewall the port / use a VPN.
 
 ### Controller API
 
-Port `3333` speaks Fetchline Controller Protocol v1: fixed 16-byte binary
-frames beginning with `FL`, protocol version `1`, a message code, and a
-little-endian request sequence. The normal requests are `Ping`, `StartMotor`,
-`StopMotor`, `SetPosition`, and `ReadPosition`. The MCU replies with the same
-sequence and an acknowledgement, position, or stable error code. This protocol
-is implemented in the shared [`protocol/`](protocol/) crate.
+Port `3333` exposes [JSON-RPC 2.0](https://www.jsonrpc.org/specification) in
+WebSocket text frames at `ws://<mcu-ip>:3333/rpc`. Requests use numeric
+JSON-RPC IDs; the reply carries the same ID. The API methods are
+`system.ping`, `motor.start`, `motor.stop`, `servo.setPosition`,
+`servo.getPosition`, `servo.getPositions`, `debug.enableRawTunnel`, and
+`debug.disableRawTunnel`. The complete method and parameter reference is in
+[`protocol/README.md`](protocol/README.md).
 
-The raw UART tunnel exists only for special tests. A client on a controller
-connection must explicitly send the `OpenRawTunnel` debug command; after the
-MCU replies `RawTunnelReady`, that **same TCP session** becomes an unframed raw
-UART tunnel until it disconnects. The next connection always starts in
-controller mode. The included host can request this mode with:
+For example, a position command is:
+
+```json
+{"jsonrpc":"2.0","id":42,"method":"servo.setPosition","params":{"id":5,"position":1625,"acceleration":20,"torqueLimit":1000}}
+```
+
+The raw UART tunnel exists only for special tests. Calling
+`debug.enableRawTunnel` opens the separate TCP port `3334`; it does **not**
+change or close the controller WebSocket. The RAW port stays open across any
+number of raw-client disconnects and reconnects. Only
+`debug.disableRawTunnel` closes it, including an active raw client. While it
+is enabled, normal motor and servo methods fail with JSON-RPC error `-32010`.
+The included host can enable it and connect its raw test path with:
 
 ```sh
 just host-debug-tunnel
@@ -123,7 +132,7 @@ assigned address is also printed to the USB serial monitor.
 | Servo UART | UART1, 1,000,000 baud, 8N1 |
 | Servo UART RX | GPIO20, board pin `RX` |
 | Servo UART TX | GPIO21, board pin `TX` |
-| Network endpoint | Controller Protocol v1 TCP server, port 3333 |
+| Network endpoint | JSON-RPC 2.0 WebSocket server at `ws://<IP>:3333/rpc` |
 
 The OLED address is presumed from this board family because it was not listed
 by the seller. If the screen stays blank, scan the I2C bus and try `0x3d` in
@@ -203,7 +212,7 @@ not a 5 GHz-only network. If automatic download mode fails, hold **BOOT**, tap
 After DHCP completes, the USB log contains a line similar to:
 
 ```text
-Wi-Fi ready: IP 192.168.1.123/24, controller TCP port 3333
+Wi-Fi ready: IP 192.168.1.123/24, JSON-RPC WebSocket port 3333
 ```
 
 Reserve that address for the board in the router's DHCP settings so controller
@@ -212,19 +221,20 @@ clients can reconnect to a stable endpoint.
 ## Raw UART debug tunnel
 
 The old transparent UART bridge is no longer the default service. It is a
-debug-only session enabled by `OpenRawTunnel`, then ended on TCP disconnect.
-Generic virtual-COM tools cannot use it by merely opening port 3333 because
-they do not send the required controller command first. Use
-`just host-debug-tunnel` for controlled browser-based testing, or a test client
-that implements the documented debug handshake and keeps that one TCP session
-open.
+debug-only listener enabled by the JSON-RPC method `debug.enableRawTunnel`.
+When enabled, port `3334` accepts one raw TCP client at a time. A client can
+disconnect and reconnect later without disabling the listener. Use
+`debug.disableRawTunnel` to close it explicitly. Generic virtual-COM tools
+cannot use it by merely opening port `3333`; they must use `3334` after the
+debug command has enabled that port. `just host-debug-tunnel` provides a
+controlled browser-based raw test path.
 
 ## Security
 
-Port 3333 has no authentication or encryption. Controller commands can move
-physical actuators, and the debug command enables an unrestricted raw UART
-tunnel for its TCP session. Use this firmware only on a trusted private LAN or
-through a VPN. Never expose or port-forward TCP 3333 to the public internet.
+Port `3333` has no authentication or encryption. Controller commands can move
+physical actuators, and its debug command can open unrestricted raw UART port
+`3334`. Use this firmware only on a trusted private LAN or through a VPN. Never
+expose or port-forward either port to the public internet.
 
 ## Development checks
 

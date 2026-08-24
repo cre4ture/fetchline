@@ -17,21 +17,24 @@ use axum::{
     Router,
     extract::{
         ConnectInfo, State, WebSocketUpgrade,
-        ws::{Message, WebSocket},
+        ws::{Message as BrowserMessage, WebSocket},
     },
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
     Json,
 };
-use fetchline_protocol::{Command, ErrorCode, FRAME_LEN, Frame, Response as ControllerResponse};
+use fetchline_protocol::{CONTROLLER_WEBSOCKET_PATH, RAW_TUNNEL_TCP_PORT};
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Mutex,
-    time::timeout,
+    time::{sleep, timeout},
 };
+use tokio_tungstenite::{WebSocketStream, client_async, tungstenite::Message as ControllerMessage};
 
 const DEFAULT_LISTEN_ADDRESS: &str = "0.0.0.0:8787";
 const SERVO_TIMEOUT: Duration = Duration::from_millis(750);
@@ -122,9 +125,13 @@ enum TransportMode {
 
 struct BridgeConnection {
     peer: String,
-    stream: TcpStream,
-    transport: TransportMode,
-    next_sequence: u32,
+    transport: BridgeTransport,
+    next_request_id: u32,
+}
+
+enum BridgeTransport {
+    Controller(Box<WebSocketStream<TcpStream>>),
+    DebugRaw(TcpStream),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -240,7 +247,7 @@ impl ClientMessage {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Direction {
     Clockwise,
@@ -270,7 +277,7 @@ enum ServerMessage {
     },
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct Position {
     id: u8,
     position: i16,
@@ -544,7 +551,7 @@ async fn websocket(
 async fn client_session(mut socket: WebSocket, state: AppState, browser_peer: SocketAddr) {
     while let Some(message) = socket.recv().await {
         let response = match message {
-            Ok(Message::Text(text)) => match serde_json::from_str(&text) {
+            Ok(BrowserMessage::Text(text)) => match serde_json::from_str(&text) {
                 Ok(request) => handle_request(&state, request).await,
                 Err(error) => {
                     log::warn!("browser sent invalid control request peer={browser_peer}: {error}");
@@ -554,12 +561,12 @@ async fn client_session(mut socket: WebSocket, state: AppState, browser_peer: So
                     }
                 }
             },
-            Ok(Message::Close(_)) => {
+            Ok(BrowserMessage::Close(_)) => {
                 log::info!("browser WebSocket closed peer={browser_peer}");
                 break;
             }
-            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
-            Ok(Message::Binary(_)) => {
+            Ok(BrowserMessage::Ping(_)) | Ok(BrowserMessage::Pong(_)) => continue,
+            Ok(BrowserMessage::Binary(_)) => {
                 log::warn!("browser sent unsupported binary WebSocket message peer={browser_peer}");
                 ServerMessage::Error {
                     message: "Binary WebSocket messages are not supported".to_owned(),
@@ -576,7 +583,7 @@ async fn client_session(mut socket: WebSocket, state: AppState, browser_peer: So
             log::error!("could not serialize browser response");
             continue;
         };
-        if socket.send(Message::Text(json.into())).await.is_err() {
+        if socket.send(BrowserMessage::Text(json.into())).await.is_err() {
             log::info!("browser WebSocket closed before its response was sent peer={browser_peer}");
             break;
         }
@@ -675,9 +682,8 @@ async fn connect(state: &AppState, host: String, port: u16) -> ServerMessage {
     }
 
     let peer = format!("{host}:{port}");
-    // The ESP32 bridge accepts one TCP client. Reuse an existing connection to
-    // the same MCU instead of attempting a second connection, which the MCU
-    // correctly refuses while the first one is active.
+    // Reuse the existing WebSocket session to the selected MCU. The MCU accepts
+    // one controller client at a time, while the raw debug endpoint is separate.
     let mut bridge = state.bridge.lock().await;
     if bridge
         .as_ref()
@@ -687,8 +693,8 @@ async fn connect(state: &AppState, host: String, port: u16) -> ServerMessage {
         return ServerMessage::Connected { address: peer };
     }
 
-    // Switching targets deliberately closes the previous client before opening
-    // the new one, so the prior one-client MCU can accept the new connection.
+    // Switching targets deliberately closes the previous controller session
+    // before opening the new WebSocket connection.
     if let Some(previous) = bridge.take() {
         log::info!("closing MCU TCP connection peer={} before switching to peer={peer}", previous.peer);
     }
@@ -698,27 +704,19 @@ async fn connect(state: &AppState, host: String, port: u16) -> ServerMessage {
         SERVO_TIMEOUT.as_millis()
     );
     let started = Instant::now();
-    match timeout(SERVO_TIMEOUT, TcpStream::connect(&peer)).await {
-        Ok(Ok(stream)) => {
-            if let Err(error) = stream.set_nodelay(true) {
-                log::error!("MCU TCP connection setup failed peer={peer}: could not enable TCP_NODELAY: {error}");
-                return ServerMessage::Error {
-                    message: format!("Connected to {peer}, but could not configure TCP: {error}"),
-                    bridge_connected: false,
-                };
-            }
+    match connect_controller(&peer).await {
+        Ok(websocket) => {
             let mut connection = BridgeConnection {
                 peer: peer.clone(),
-                stream,
-                transport: TransportMode::Controller,
-                next_sequence: 1,
+                transport: BridgeTransport::Controller(Box::new(websocket)),
+                next_request_id: 1,
             };
             let setup = match transport {
                 TransportMode::Controller => connection
-                    .controller_request(Command::Ping)
+                    .controller_request("system.ping", serde_json::json!({}))
                     .await
-                    .and_then(expect_controller_ack),
-                TransportMode::DebugRawTunnel => connection.open_raw_tunnel().await,
+                    .and_then(expect_controller_ready),
+                TransportMode::DebugRawTunnel => connection.open_raw_tunnel(host).await,
             };
             if let Err(error) = setup {
                 log::warn!("MCU protocol setup failed peer={peer} transport={transport:?}: {error}");
@@ -729,32 +727,66 @@ async fn connect(state: &AppState, host: String, port: u16) -> ServerMessage {
             }
             *bridge = Some(connection);
             log::info!(
-                "MCU TCP connection established peer={peer} transport={transport:?} elapsed_ms={}",
+                "MCU JSON-RPC connection established peer={peer} transport={transport:?} elapsed_ms={}",
                 started.elapsed().as_millis()
             );
             ServerMessage::Connected { address: peer }
         }
-        Ok(Err(error)) => {
+        Err(error) => {
             log::warn!(
-                "MCU TCP connection failed peer={peer} elapsed_ms={}: {error}",
+                "MCU JSON-RPC connection failed peer={peer} elapsed_ms={}: {error}",
                 started.elapsed().as_millis()
             );
             ServerMessage::Error {
-                message: format!("Could not connect to {peer}: {error}"),
-                bridge_connected: false,
-            }
-        }
-        Err(_) => {
-            log::warn!(
-                "MCU TCP connection timed out peer={peer} timeout_ms={}",
-                SERVO_TIMEOUT.as_millis()
-            );
-            ServerMessage::Error {
-                message: format!("Timed out connecting to {peer}"),
+                message: error,
                 bridge_connected: false,
             }
         }
     }
+}
+
+async fn connect_controller(peer: &str) -> Result<WebSocketStream<TcpStream>, String> {
+    let stream = timeout(SERVO_TIMEOUT, TcpStream::connect(peer))
+        .await
+        .map_err(|_| format!("Timed out connecting to {peer}"))?
+        .map_err(|error| format!("Could not connect to {peer}: {error}"))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|error| format!("Connected to {peer}, but could not configure TCP: {error}"))?;
+    let endpoint = format!("ws://{peer}{CONTROLLER_WEBSOCKET_PATH}");
+    timeout(SERVO_TIMEOUT, client_async(endpoint, stream))
+        .await
+        .map_err(|_| format!("Timed out opening the JSON-RPC WebSocket to {peer}"))?
+        .map(|(websocket, _)| websocket)
+        .map_err(|error| format!("Could not open the JSON-RPC WebSocket to {peer}: {error}"))
+}
+
+async fn connect_raw_tunnel(peer: &str) -> Result<TcpStream, String> {
+    // The MCU starts a separate async listener after it acknowledges
+    // debug.enableRawTunnel. Retrying briefly avoids a TCP race between that
+    // response reaching the host and the listener's first poll.
+    let started = Instant::now();
+    let stream = loop {
+        let elapsed = started.elapsed();
+        let Some(remaining) = SERVO_TIMEOUT.checked_sub(elapsed) else {
+            return Err(format!("Timed out connecting to raw tunnel {peer}"));
+        };
+        let attempt_timeout = remaining.min(Duration::from_millis(100));
+        match timeout(attempt_timeout, TcpStream::connect(peer)).await {
+            Ok(Ok(stream)) => break stream,
+            Ok(Err(error)) => {
+                log::debug!("raw tunnel {peer} is not ready yet: {error}");
+            }
+            Err(_) => {
+                log::debug!("raw tunnel {peer} connection attempt timed out");
+            }
+        }
+        sleep(Duration::from_millis(25)).await;
+    };
+    stream
+        .set_nodelay(true)
+        .map_err(|error| format!("Connected to raw tunnel {peer}, but could not configure TCP: {error}"))?;
+    Ok(stream)
 }
 
 async fn start_motor(
@@ -769,16 +801,22 @@ async fn start_motor(
         return Err("Motor speed must be between 0 and 4095".to_owned());
     }
 
-    if connection.transport == TransportMode::Controller {
+    if connection.is_controller() {
         connection
-            .controller_request(Command::StartMotor {
-                id,
-                counter_clockwise: matches!(direction, Direction::Counterclockwise),
-                speed,
-                acceleration,
-            })
+            .controller_request(
+                "motor.start",
+                serde_json::json!({
+                    "id": id,
+                    "speed": speed,
+                    "acceleration": acceleration,
+                    "direction": match direction {
+                        Direction::Clockwise => "clockwise",
+                        Direction::Counterclockwise => "counterclockwise",
+                    },
+                }),
+            )
             .await
-            .and_then(expect_controller_ack)?;
+            .and_then(expect_controller_accepted)?;
         return Ok(ServerMessage::Complete {
             action: "motor_started",
         });
@@ -818,11 +856,11 @@ async fn raw_start_motor(
 
 async fn stop_motor(connection: &mut BridgeConnection, id: u8) -> Result<ServerMessage, String> {
     validate_id(id)?;
-    if connection.transport == TransportMode::Controller {
+    if connection.is_controller() {
         connection
-            .controller_request(Command::StopMotor { id })
+            .controller_request("motor.stop", serde_json::json!({ "id": id }))
             .await
-            .and_then(expect_controller_ack)?;
+            .and_then(expect_controller_accepted)?;
         return Ok(ServerMessage::Complete {
             action: "motor_stopped",
         });
@@ -860,16 +898,19 @@ async fn move_position(
         return Err("Torque limit must be between 0 and 1000".to_owned());
     }
 
-    if connection.transport == TransportMode::Controller {
+    if connection.is_controller() {
         connection
-            .controller_request(Command::SetPosition {
-                id,
-                position,
-                acceleration,
-                torque_limit,
-            })
+            .controller_request(
+                "servo.setPosition",
+                serde_json::json!({
+                    "id": id,
+                    "position": position,
+                    "acceleration": acceleration,
+                    "torqueLimit": torque_limit,
+                }),
+            )
             .await
-            .and_then(expect_controller_ack)?;
+            .and_then(expect_controller_accepted)?;
         return Ok(ServerMessage::Complete {
             action: "position_commanded",
         });
@@ -910,19 +951,19 @@ async fn raw_move_position(
 
 async fn read_position(connection: &mut BridgeConnection, id: u8) -> Result<i16, String> {
     validate_id(id)?;
-    if connection.transport == TransportMode::Controller {
-        return match connection.controller_request(Command::ReadPosition { id }).await? {
-            ControllerResponse::Position {
-                id: response_id,
-                position,
-            } if response_id == id => Ok(position),
-            ControllerResponse::Position {
-                id: response_id, ..
-            } => Err(format!(
-                "MCU returned a position for servo {response_id}, but servo {id} was requested"
-            )),
-            response => Err(format!("MCU returned an unexpected response to position read: {response:?}")),
-        };
+    if connection.is_controller() {
+        let response = connection
+            .controller_request("servo.getPosition", serde_json::json!({ "id": id }))
+            .await?;
+        let position: Position = serde_json::from_value(response)
+            .map_err(|error| format!("MCU returned an invalid position result: {error}"))?;
+        if position.id != id {
+            return Err(format!(
+                "MCU returned a position for servo {}, but servo {id} was requested",
+                position.id
+            ));
+        }
+        return Ok(position.position);
     }
     raw_read_position(connection, id).await
 }
@@ -984,47 +1025,111 @@ fn validate_id(id: u8) -> Result<(), String> {
 }
 
 impl BridgeConnection {
-    async fn controller_request(&mut self, command: Command) -> Result<ControllerResponse, String> {
-        if self.transport != TransportMode::Controller {
-            return Err("the MCU connection is in debug raw-tunnel mode".to_owned());
-        }
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.wrapping_add(1);
-        let frame = Frame::command(sequence, command).encode();
-        write_controller_frame(&mut self.stream, &frame).await?;
-
-        for _ in 0..MAX_STALE_CONTROLLER_RESPONSES {
-            let frame = read_controller_frame(&mut self.stream).await?;
-            let response_sequence = frame.sequence();
-            if response_sequence != sequence {
-                log::warn!(
-                    "discarding stale MCU controller response peer={} expected_sequence={sequence} response_sequence={response_sequence}",
-                    self.peer
-                );
-                continue;
-            }
-            return match frame.as_response() {
-                Ok(ControllerResponse::Error { code, detail }) => {
-                    Err(controller_error_message(code, detail))
-                }
-                Ok(response) => Ok(response),
-                Err(error) => Err(format!("MCU sent an invalid controller response: {error:?}")),
-            };
-        }
-        Err("MCU sent too many stale controller responses".to_owned())
+    fn is_controller(&self) -> bool {
+        matches!(self.transport, BridgeTransport::Controller(_))
     }
 
-    async fn open_raw_tunnel(&mut self) -> Result<(), String> {
-        match self.controller_request(Command::OpenRawTunnel).await? {
-            ControllerResponse::RawTunnelReady => {
-                self.transport = TransportMode::DebugRawTunnel;
-                log::warn!("MCU debug raw tunnel enabled peer={}", self.peer);
-                Ok(())
+    fn raw_stream_mut(&mut self) -> Result<&mut TcpStream, String> {
+        match &mut self.transport {
+            BridgeTransport::DebugRaw(stream) => Ok(stream),
+            BridgeTransport::Controller(_) => {
+                Err("the MCU connection is in JSON-RPC controller mode".to_owned())
             }
-            response => Err(format!(
-                "MCU returned an unexpected response while enabling the debug raw tunnel: {response:?}"
-            )),
         }
+    }
+
+    async fn controller_request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        let request = serde_json::to_string(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }))
+        .map_err(|error| format!("Could not encode JSON-RPC request: {error}"))?;
+        let websocket = match &mut self.transport {
+            BridgeTransport::Controller(websocket) => websocket,
+            BridgeTransport::DebugRaw(_) => {
+                return Err("the MCU connection is in debug raw-tunnel mode".to_owned());
+            }
+        };
+        timeout(
+            SERVO_TIMEOUT,
+            websocket.send(ControllerMessage::Text(request.into())),
+        )
+        .await
+        .map_err(|_| "Timed out sending a JSON-RPC command to the MCU".to_owned())?
+        .map_err(|error| format!("Could not send a JSON-RPC command to the MCU: {error}"))?;
+
+        for _ in 0..MAX_STALE_CONTROLLER_RESPONSES {
+            let message = timeout(SERVO_TIMEOUT, websocket.next())
+                .await
+                .map_err(|_| "Timed out waiting for an MCU JSON-RPC response".to_owned())?
+                .ok_or_else(|| "MCU closed the JSON-RPC WebSocket".to_owned())?
+                .map_err(|error| format!("Could not read an MCU JSON-RPC response: {error}"))?;
+            match message {
+                ControllerMessage::Text(text) => {
+                    let response: ControllerJsonRpcResponse = serde_json::from_str(&text)
+                        .map_err(|error| format!("MCU sent invalid JSON-RPC: {error}"))?;
+                    if response.jsonrpc != "2.0" {
+                        return Err("MCU sent a JSON-RPC response with an unsupported version".to_owned());
+                    }
+                    if response.id != Some(request_id) {
+                        log::warn!(
+                            "discarding stale MCU JSON-RPC response peer={} expected_id={request_id} response_id={:?}",
+                            self.peer,
+                            response.id
+                        );
+                        continue;
+                    }
+                    return match (response.result, response.error) {
+                        (Some(result), None) => Ok(result),
+                        (None, Some(error)) => Err(format!(
+                            "MCU JSON-RPC error {}: {}",
+                            error.code, error.message
+                        )),
+                        _ => Err("MCU returned an invalid JSON-RPC result/error combination".to_owned()),
+                    };
+                }
+                ControllerMessage::Ping(payload) => {
+                    websocket
+                        .send(ControllerMessage::Pong(payload))
+                        .await
+                        .map_err(|error| format!("Could not answer MCU WebSocket ping: {error}"))?;
+                }
+                ControllerMessage::Pong(_) => continue,
+                ControllerMessage::Close(_) => {
+                    return Err("MCU closed the JSON-RPC WebSocket".to_owned());
+                }
+                ControllerMessage::Binary(_) | ControllerMessage::Frame(_) => {
+                    return Err("MCU sent an unsupported WebSocket message".to_owned());
+                }
+            }
+        }
+        Err("MCU sent too many stale JSON-RPC responses".to_owned())
+    }
+
+    async fn open_raw_tunnel(&mut self, host: &str) -> Result<(), String> {
+        let result = self
+            .controller_request("debug.enableRawTunnel", serde_json::json!({}))
+            .await?;
+        let port = result
+            .get("port")
+            .and_then(Value::as_u64)
+            .and_then(|port| u16::try_from(port).ok())
+            .ok_or_else(|| "MCU did not return a raw tunnel TCP port".to_owned())?;
+        if port != RAW_TUNNEL_TCP_PORT {
+            return Err(format!("MCU returned unexpected raw tunnel TCP port {port}"));
+        }
+        let raw_peer = format!("{host}:{port}");
+        let stream = connect_raw_tunnel(&raw_peer).await?;
+        self.transport = BridgeTransport::DebugRaw(stream);
+        log::warn!(
+            "MCU debug raw tunnel enabled controller_peer={} raw_peer={raw_peer}; it remains enabled until debug.disableRawTunnel",
+            self.peer
+        );
+        Ok(())
     }
 
     async fn write_register(&mut self, id: u8, address: u8, data: &[u8]) -> Result<(), String> {
@@ -1063,7 +1168,7 @@ impl BridgeConnection {
             self.peer,
             parameters.len()
         );
-        write_with_timeout(&mut self.stream, &packet).await
+        write_with_timeout(self.raw_stream_mut()?, &packet).await
     }
 
     async fn read_status(
@@ -1071,9 +1176,10 @@ impl BridgeConnection {
         expected_id: u8,
         data_length: usize,
     ) -> Result<Vec<u8>, String> {
-        find_header(&mut self.stream).await?;
+        let stream = self.raw_stream_mut()?;
+        find_header(stream).await?;
         let mut fixed = [0_u8; 2];
-        read_exact_with_timeout(&mut self.stream, &mut fixed).await?;
+        read_exact_with_timeout(stream, &mut fixed).await?;
         let id = fixed[0];
         let length = fixed[1] as usize;
         if id != expected_id {
@@ -1086,7 +1192,7 @@ impl BridgeConnection {
         }
 
         let mut body = vec![0_u8; length];
-        read_exact_with_timeout(&mut self.stream, &mut body).await?;
+        read_exact_with_timeout(stream, &mut body).await?;
         let checksum_index = body.len() - 1;
         let expected_checksum = checksum_for_status(id, fixed[1], &body[..checksum_index]);
         if body[checksum_index] != expected_checksum {
@@ -1107,40 +1213,36 @@ impl BridgeConnection {
     }
 }
 
-fn expect_controller_ack(response: ControllerResponse) -> Result<(), String> {
-    match response {
-        ControllerResponse::Ack => Ok(()),
-        response => Err(format!("MCU returned an unexpected controller response: {response:?}")),
+#[derive(Deserialize)]
+struct ControllerJsonRpcResponse {
+    jsonrpc: String,
+    id: Option<u32>,
+    #[serde(default)]
+    result: Option<Value>,
+    #[serde(default)]
+    error: Option<ControllerJsonRpcError>,
+}
+
+#[derive(Deserialize)]
+struct ControllerJsonRpcError {
+    code: i32,
+    message: String,
+}
+
+fn expect_controller_ready(result: Value) -> Result<(), String> {
+    if result.get("ready").and_then(Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err("MCU returned an unexpected result to system.ping".to_owned())
     }
 }
 
-fn controller_error_message(code: ErrorCode, detail: u16) -> String {
-    match code {
-        ErrorCode::UnsupportedCommand => "The MCU does not support this controller command".to_owned(),
-        ErrorCode::InvalidServoId => "The MCU rejected the servo ID".to_owned(),
-        ErrorCode::InvalidArgument => "The MCU rejected an out-of-range controller argument".to_owned(),
-        ErrorCode::ServoTimeout => "The MCU timed out waiting for an STS servo reply".to_owned(),
-        ErrorCode::InvalidServoReply => "The MCU received an invalid STS servo reply".to_owned(),
-        ErrorCode::ServoReportedError => format!("Servo reported STS error 0x{detail:02x}"),
-        ErrorCode::ServoTransport => "The MCU could not communicate with the STS UART".to_owned(),
-        ErrorCode::InvalidRequest => "The MCU rejected the controller request".to_owned(),
+fn expect_controller_accepted(result: Value) -> Result<(), String> {
+    if result.get("accepted").and_then(Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err("MCU rejected the controller command without an accepted result".to_owned())
     }
-}
-
-async fn write_controller_frame(stream: &mut TcpStream, bytes: &[u8; FRAME_LEN]) -> Result<(), String> {
-    timeout(SERVO_TIMEOUT, stream.write_all(bytes))
-        .await
-        .map_err(|_| "Timed out sending a controller command to the MCU".to_owned())?
-        .map_err(|error| format!("Could not send a controller command to the MCU: {error}"))
-}
-
-async fn read_controller_frame(stream: &mut TcpStream) -> Result<Frame, String> {
-    let mut bytes = [0_u8; FRAME_LEN];
-    timeout(SERVO_TIMEOUT, stream.read_exact(&mut bytes))
-        .await
-        .map_err(|_| "Timed out waiting for an MCU controller response".to_owned())?
-        .map_err(|error| format!("Could not read an MCU controller response: {error}"))?;
-    Frame::decode(bytes).map_err(|error| format!("MCU sent an invalid controller frame: {error:?}"))
 }
 
 async fn find_header(stream: &mut TcpStream) -> Result<(), String> {
@@ -1199,6 +1301,7 @@ mod tests {
         http::{Request, StatusCode},
     };
     use tempfile::tempdir;
+    use tokio_tungstenite::accept_async;
     use tower::ServiceExt;
 
     #[test]
@@ -1364,23 +1467,29 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let mcu = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let request = receive_controller_frame(&mut stream).await;
-            assert_eq!(
-                request.as_command(),
-                Ok(Command::SetPosition {
-                    id: 5,
-                    position: 1625,
-                    acceleration: 20,
-                    torque_limit: 1000,
-                })
-            );
-            stream
-                .write_all(&Frame::response(0, ControllerResponse::Ack).encode())
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            let request = receive_json_rpc_request(&mut websocket).await;
+            assert_eq!(request["jsonrpc"], "2.0");
+            assert_eq!(request["method"], "servo.setPosition");
+            assert_eq!(request["params"]["id"], 5);
+            assert_eq!(request["params"]["position"], 1625);
+            assert_eq!(request["params"]["acceleration"], 20);
+            assert_eq!(request["params"]["torqueLimit"], 1000);
+            websocket
+                .send(ControllerMessage::Text(
+                    serde_json::json!({ "jsonrpc": "2.0", "id": 0, "result": { "accepted": true } })
+                        .to_string()
+                        .into(),
+                ))
                 .await
                 .unwrap();
-            stream
-                .write_all(&Frame::response(request.sequence(), ControllerResponse::Ack).encode())
+            websocket
+                .send(ControllerMessage::Text(
+                    serde_json::json!({ "jsonrpc": "2.0", "id": request["id"], "result": { "accepted": true } })
+                        .to_string()
+                        .into(),
+                ))
                 .await
                 .unwrap();
         });
@@ -1393,25 +1502,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn debug_raw_tunnel_is_enabled_by_an_explicit_controller_command() {
+    async fn raw_tunnel_enable_is_an_explicit_json_rpc_command() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let mcu = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let request = receive_controller_frame(&mut stream).await;
-            assert_eq!(request.as_command(), Ok(Command::OpenRawTunnel));
-            stream
-                .write_all(
-                    &Frame::response(request.sequence(), ControllerResponse::RawTunnelReady)
-                        .encode(),
-                )
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            let request = receive_json_rpc_request(&mut websocket).await;
+            assert_eq!(request["method"], "debug.enableRawTunnel");
+            websocket
+                .send(ControllerMessage::Text(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": { "port": RAW_TUNNEL_TCP_PORT, "active": true }
+                    })
+                    .to_string()
+                    .into(),
+                ))
                 .await
                 .unwrap();
         });
 
         let mut bridge = controller_bridge(address).await;
-        bridge.open_raw_tunnel().await.unwrap();
-        assert_eq!(bridge.transport, TransportMode::DebugRawTunnel);
+        let result = bridge
+            .controller_request("debug.enableRawTunnel", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(result["port"], RAW_TUNNEL_TCP_PORT);
+        assert_eq!(result["active"], true);
         mcu.await.unwrap();
     }
 
@@ -1549,16 +1668,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconnecting_to_the_same_mcu_reuses_its_single_tcp_client() {
+    async fn reconnecting_to_the_same_mcu_reuses_its_websocket_client() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let state = AppState::default();
         let controller = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let frame = receive_controller_frame(&mut stream).await;
-            assert_eq!(frame.as_command(), Ok(Command::Ping));
-            stream
-                .write_all(&Frame::response(frame.sequence(), ControllerResponse::Ack).encode())
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            let request = receive_json_rpc_request(&mut websocket).await;
+            assert_eq!(request["method"], "system.ping");
+            websocket
+                .send(ControllerMessage::Text(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": { "ready": true }
+                    })
+                    .to_string()
+                    .into(),
+                ))
                 .await
                 .unwrap();
         });
@@ -1609,18 +1737,19 @@ mod tests {
     async fn raw_bridge(address: SocketAddr) -> BridgeConnection {
         BridgeConnection {
             peer: address.to_string(),
-            stream: TcpStream::connect(address).await.unwrap(),
-            transport: TransportMode::DebugRawTunnel,
-            next_sequence: 1,
+            transport: BridgeTransport::DebugRaw(TcpStream::connect(address).await.unwrap()),
+            next_request_id: 1,
         }
     }
 
     async fn controller_bridge(address: SocketAddr) -> BridgeConnection {
+        let stream = TcpStream::connect(address).await.unwrap();
+        let endpoint = format!("ws://{address}{CONTROLLER_WEBSOCKET_PATH}");
+        let (websocket, _) = client_async(endpoint, stream).await.unwrap();
         BridgeConnection {
             peer: address.to_string(),
-            stream: TcpStream::connect(address).await.unwrap(),
-            transport: TransportMode::Controller,
-            next_sequence: 1,
+            transport: BridgeTransport::Controller(Box::new(websocket)),
+            next_request_id: 1,
         }
     }
 
@@ -1634,10 +1763,12 @@ mod tests {
         [header_and_fixed.to_vec(), remaining].concat()
     }
 
-    async fn receive_controller_frame(stream: &mut TcpStream) -> Frame {
-        let mut bytes = [0_u8; FRAME_LEN];
-        stream.read_exact(&mut bytes).await.unwrap();
-        Frame::decode(bytes).unwrap()
+    async fn receive_json_rpc_request(websocket: &mut WebSocketStream<TcpStream>) -> Value {
+        let message = websocket.next().await.unwrap().unwrap();
+        let ControllerMessage::Text(text) = message else {
+            panic!("JSON-RPC request must be a WebSocket text message");
+        };
+        serde_json::from_str(&text).unwrap()
     }
 
     fn status_packet(id: u8, payload: &[u8]) -> Vec<u8> {
