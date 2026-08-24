@@ -22,6 +22,10 @@ host address="0.0.0.0:8787":
 host-debug address="0.0.0.0:8787":
     FETCHLINE_LOG=debug cargo run --manifest-path host/Cargo.toml --target "{{host_target}}" --release --bin fetchline-host -- "{{address}}"
 
+# Testing only: have the MCU enter its raw STS UART tunnel for this host session.
+host-debug-tunnel address="0.0.0.0:8787":
+    FETCHLINE_LOG=debug cargo run --manifest-path host/Cargo.toml --target "{{host_target}}" --release --bin fetchline-host -- --debug-raw-tunnel "{{address}}"
+
 # Show the most recent host diagnostics.
 host-logs:
     tail -n 200 "${XDG_STATE_HOME:-$HOME/.local/state}/fetchline-host/fetchline-host.log"

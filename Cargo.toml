@@ -51,6 +51,7 @@ esp-rtos = { version = "0.3.0", features = [
   "log-04",
 ] }
 log = "0.4.27"
+fetchline-protocol = { path = "protocol" }
 ssd1306 = "0.10.0"
 static_cell = "2.1.1"
 

@@ -1094,10 +1094,15 @@ dependencies = [
  "esp-radio",
  "esp-rom-sys",
  "esp-rtos",
+ "fetchline-protocol",
  "log",
  "ssd1306",
  "static_cell",
 ]
+
+[[package]]
+name = "fetchline-protocol"
+version = "0.1.0"
 
 [[package]]
 name = "find-msvc-tools"

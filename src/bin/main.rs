@@ -10,7 +10,7 @@
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_net::{Runner, StackResources, tcp::TcpSocket};
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Timer, with_timeout};
 use embedded_graphics::{
     draw_target::DrawTarget,
     mono_font::{MonoTextStyle, ascii::FONT_6X10},
@@ -22,20 +22,24 @@ use embedded_graphics::{
 use embedded_io_async::{Read, Write};
 use esp_backtrace as _;
 use esp_hal::{
+    Async,
     clock::CpuClock,
     i2c::master::{Config as I2cConfig, I2c},
     interrupt::software::SoftwareInterruptControl,
     rng::Rng,
     time::Rate,
     timer::timg::TimerGroup,
-    uart::{Config as UartConfig, Uart},
+    uart::{Config as UartConfig, Uart, UartRx, UartTx},
 };
 use esp_radio::wifi::{
     Config as WifiConfig, ControllerConfig, Interface, WifiController, sta::StationConfig,
 };
 use fetchline::board::{
-    BRIDGE_TCP_PORT, OLED_CONTROLLER, OLED_HEIGHT, OLED_I2C_ADDRESS, OLED_WIDTH, SERVO_UART_BAUD,
+    OLED_CONTROLLER, OLED_HEIGHT, OLED_I2C_ADDRESS, OLED_WIDTH, SERVO_UART_BAUD,
     SERVO_UART_RX_GPIO, SERVO_UART_TX_GPIO,
+};
+use fetchline_protocol::{
+    CONTROLLER_TCP_PORT, Command, DecodeError, ErrorCode, FRAME_LEN, Frame, Response,
 };
 use log::{info, warn};
 use ssd1306::{I2CDisplayInterface, Ssd1306, prelude::*};
@@ -47,6 +51,16 @@ use core::fmt;
 
 const TCP_BUFFER_SIZE: usize = 4096;
 const COPY_BUFFER_SIZE: usize = 512;
+const STS_RESPONSE_TIMEOUT: Duration = Duration::from_millis(50);
+const STS_HEADER: [u8; 2] = [0xff, 0xff];
+const STS_BROADCAST_ID: u8 = 0xfe;
+const STS_INSTRUCTION_READ: u8 = 0x02;
+const STS_INSTRUCTION_WRITE: u8 = 0x03;
+const STS_MODE: u8 = 33;
+const STS_TORQUE_ENABLE: u8 = 40;
+const STS_ACCELERATION: u8 = 41;
+const STS_TORQUE_LIMIT: u8 = 48;
+const STS_PRESENT_POSITION: u8 = 56;
 const WIFI_CONFIG_FLASH_OFFSET: usize = 0x003f_0000;
 const WIFI_CONFIG_MAGIC: [u8; 4] = *b"FLWC";
 const WIFI_CONFIG_VERSION: u8 = 1;
@@ -104,6 +118,54 @@ impl fmt::Display for BridgeExit {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ControllerSessionExit {
+    PeerClosed,
+    InvalidFrame(DecodeError),
+    DebugTunnelRequested,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ServoFailure {
+    InvalidServoId,
+    InvalidArgument,
+    Timeout,
+    InvalidReply,
+    ReportedError(u8),
+    Transport,
+}
+
+impl ServoFailure {
+    const fn response(self) -> Response {
+        match self {
+            Self::InvalidServoId => Response::Error {
+                code: ErrorCode::InvalidServoId,
+                detail: 0,
+            },
+            Self::InvalidArgument => Response::Error {
+                code: ErrorCode::InvalidArgument,
+                detail: 0,
+            },
+            Self::Timeout => Response::Error {
+                code: ErrorCode::ServoTimeout,
+                detail: 0,
+            },
+            Self::InvalidReply => Response::Error {
+                code: ErrorCode::InvalidServoReply,
+                detail: 0,
+            },
+            Self::ReportedError(status) => Response::Error {
+                code: ErrorCode::ServoReportedError,
+                detail: status as u16,
+            },
+            Self::Transport => Response::Error {
+                code: ErrorCode::ServoTransport,
+                detail: 0,
+            },
+        }
+    }
+}
+
 #[allow(
     clippy::large_stack_frames,
     reason = "the network stack and TCP buffers intentionally live for the lifetime of main"
@@ -128,7 +190,7 @@ async fn main(spawner: Spawner) -> ! {
     let mut display = Ssd1306::new(interface, DisplaySize72x40, DisplayRotation::Rotate0)
         .into_buffered_graphics_mode();
     display.init().expect("failed to initialize OLED");
-    show_status(&mut display, ["FETCHLINE", "WIFI UART", "STARTING"]);
+    show_status(&mut display, ["FETCHLINE", "WIFI STS", "STARTING"]);
     display.flush().expect("failed to update OLED");
 
     info!(
@@ -201,7 +263,7 @@ async fn main(spawner: Spawner) -> ! {
         stack.wait_config_up().await;
         if let Some(config) = stack.config_v4() {
             info!(
-                "Wi-Fi ready: IP {}, raw TCP port {BRIDGE_TCP_PORT}",
+                "Wi-Fi ready: IP {}, controller TCP port {CONTROLLER_TCP_PORT}",
                 config.address
             );
             show_ip_address(&mut display, config.address.address());
@@ -213,39 +275,470 @@ async fn main(spawner: Spawner) -> ! {
         socket.set_keep_alive(Some(Duration::from_secs(10)));
         socket.set_timeout(Some(Duration::from_secs(30)));
 
-        info!("waiting for one TCP client on port {BRIDGE_TCP_PORT}");
-        if let Err(error) = socket.accept(BRIDGE_TCP_PORT).await {
+        info!("waiting for one controller TCP client on port {CONTROLLER_TCP_PORT}");
+        if let Err(error) = socket.accept(CONTROLLER_TCP_PORT).await {
             warn!("TCP accept failed: {error:?}");
             Timer::after(Duration::from_secs(1)).await;
             continue;
         }
 
-        info!("TCP client connected: {:?}", socket.remote_endpoint());
+        info!(
+            "controller TCP client connected: {:?}",
+            socket.remote_endpoint()
+        );
 
-        let result = {
-            let (mut tcp_rx, mut tcp_tx) = socket.split();
-            match select(
-                forward(
-                    &mut tcp_rx,
+        match controller_session(&mut socket, &mut uart_rx, &mut uart_tx).await {
+            ControllerSessionExit::PeerClosed => {
+                info!("controller TCP client disconnected");
+            }
+            ControllerSessionExit::InvalidFrame(error) => {
+                warn!("controller TCP session ended after invalid frame: {error:?}");
+            }
+            ControllerSessionExit::DebugTunnelRequested => {
+                warn!("debug raw UART tunnel enabled for this TCP session");
+                let result = raw_tunnel(
+                    &mut socket,
+                    &mut uart_rx,
                     &mut uart_tx,
                     &mut network_to_uart_buffer,
-                    CopyDirection::NetworkToUart,
-                ),
-                forward(
-                    &mut uart_rx,
-                    &mut tcp_tx,
                     &mut uart_to_network_buffer,
-                    CopyDirection::UartToNetwork,
-                ),
-            )
-            .await
-            {
-                Either::First(result) | Either::Second(result) => result,
+                )
+                .await;
+                warn!("debug raw UART tunnel stopped: {result}");
+            }
+        }
+        socket.abort();
+    }
+}
+
+#[allow(
+    clippy::large_stack_frames,
+    reason = "the async controller session retains the TCP socket and UART controller futures"
+)]
+async fn controller_session(
+    socket: &mut TcpSocket<'_>,
+    uart_rx: &mut UartRx<'_, Async>,
+    uart_tx: &mut UartTx<'_, Async>,
+) -> ControllerSessionExit {
+    let mut bytes = [0_u8; FRAME_LEN];
+    loop {
+        if socket.read_exact(&mut bytes).await.is_err() {
+            return ControllerSessionExit::PeerClosed;
+        }
+        let frame = match Frame::decode(bytes) {
+            Ok(frame) => frame,
+            Err(error) => return ControllerSessionExit::InvalidFrame(error),
+        };
+        let sequence = frame.sequence();
+        let command = match frame.as_command() {
+            Ok(command) => command,
+            Err(DecodeError::UnknownMessage) => {
+                if !send_controller_response(
+                    socket,
+                    sequence,
+                    Response::Error {
+                        code: ErrorCode::UnsupportedCommand,
+                        detail: 0,
+                    },
+                )
+                .await
+                {
+                    return ControllerSessionExit::PeerClosed;
+                }
+                continue;
+            }
+            Err(error) => {
+                if !send_controller_response(
+                    socket,
+                    sequence,
+                    Response::Error {
+                        code: ErrorCode::InvalidRequest,
+                        detail: 0,
+                    },
+                )
+                .await
+                {
+                    return ControllerSessionExit::PeerClosed;
+                }
+                warn!("rejected malformed controller command: {error:?}");
+                continue;
             }
         };
 
-        warn!("TCP bridge stopped: {result}");
-        socket.abort();
+        if matches!(command, Command::OpenRawTunnel) {
+            if send_controller_response(socket, sequence, Response::RawTunnelReady).await {
+                return ControllerSessionExit::DebugTunnelRequested;
+            }
+            return ControllerSessionExit::PeerClosed;
+        }
+
+        let response = execute_command(command, uart_rx, uart_tx).await;
+        if !send_controller_response(socket, sequence, response).await {
+            return ControllerSessionExit::PeerClosed;
+        }
+    }
+}
+
+async fn send_controller_response(
+    socket: &mut TcpSocket<'_>,
+    sequence: u32,
+    response: Response,
+) -> bool {
+    let bytes = Frame::response(sequence, response).encode();
+    socket.write_all(&bytes).await.is_ok()
+}
+
+#[allow(
+    clippy::large_stack_frames,
+    reason = "each controller command retains local STS UART transaction futures"
+)]
+async fn execute_command(
+    command: Command,
+    uart_rx: &mut UartRx<'_, Async>,
+    uart_tx: &mut UartTx<'_, Async>,
+) -> Response {
+    let result = match command {
+        Command::Ping => Ok(Response::Ack),
+        Command::StartMotor {
+            id,
+            counter_clockwise,
+            speed,
+            acceleration,
+        } => start_motor(uart_rx, uart_tx, id, counter_clockwise, speed, acceleration)
+            .await
+            .map(|()| Response::Ack),
+        Command::StopMotor { id } => stop_motor(uart_rx, uart_tx, id)
+            .await
+            .map(|()| Response::Ack),
+        Command::SetPosition {
+            id,
+            position,
+            acceleration,
+            torque_limit,
+        } => move_position(uart_rx, uart_tx, id, position, acceleration, torque_limit)
+            .await
+            .map(|()| Response::Ack),
+        Command::ReadPosition { id } => read_position(uart_rx, uart_tx, id)
+            .await
+            .map(|position| Response::Position { id, position }),
+        Command::OpenRawTunnel => unreachable!("debug tunnel is handled before serial execution"),
+    };
+    match result {
+        Ok(response) => response,
+        Err(error) => {
+            warn!("local STS command failed: {error:?}; draining UART before continuing");
+            resynchronize_uart(uart_rx).await;
+            error.response()
+        }
+    }
+}
+
+#[allow(
+    clippy::large_stack_frames,
+    reason = "the local STS write sequence retains UART transaction futures"
+)]
+async fn start_motor(
+    uart_rx: &mut UartRx<'_, Async>,
+    uart_tx: &mut UartTx<'_, Async>,
+    id: u8,
+    counter_clockwise: bool,
+    speed: u16,
+    acceleration: u8,
+) -> Result<(), ServoFailure> {
+    validate_servo_id(id)?;
+    if speed > 4095 {
+        return Err(ServoFailure::InvalidArgument);
+    }
+    write_register(uart_rx, uart_tx, id, STS_MODE, &[1]).await?;
+    write_register(uart_rx, uart_tx, id, STS_TORQUE_ENABLE, &[1]).await?;
+    let signed_speed = if counter_clockwise {
+        speed | 0x8000
+    } else {
+        speed
+    };
+    let mut command = [0_u8; 7];
+    command[0] = acceleration;
+    command[5..7].copy_from_slice(&signed_speed.to_le_bytes());
+    write_register(uart_rx, uart_tx, id, STS_ACCELERATION, &command).await
+}
+
+async fn stop_motor(
+    uart_rx: &mut UartRx<'_, Async>,
+    uart_tx: &mut UartTx<'_, Async>,
+    id: u8,
+) -> Result<(), ServoFailure> {
+    validate_servo_id(id)?;
+    write_register(uart_rx, uart_tx, id, STS_ACCELERATION, &[0; 7]).await
+}
+
+#[allow(
+    clippy::large_stack_frames,
+    reason = "the local STS write sequence retains UART transaction futures"
+)]
+async fn move_position(
+    uart_rx: &mut UartRx<'_, Async>,
+    uart_tx: &mut UartTx<'_, Async>,
+    id: u8,
+    position: u16,
+    acceleration: u8,
+    torque_limit: u16,
+) -> Result<(), ServoFailure> {
+    validate_servo_id(id)?;
+    if position > 4095 || torque_limit > 1000 {
+        return Err(ServoFailure::InvalidArgument);
+    }
+    write_register(uart_rx, uart_tx, id, STS_TORQUE_ENABLE, &[1]).await?;
+    write_register(
+        uart_rx,
+        uart_tx,
+        id,
+        STS_TORQUE_LIMIT,
+        &torque_limit.to_le_bytes(),
+    )
+    .await?;
+    let mut command = [0_u8; 7];
+    command[0] = acceleration;
+    command[1..3].copy_from_slice(&position.to_le_bytes());
+    write_register(uart_rx, uart_tx, id, STS_ACCELERATION, &command).await
+}
+
+#[allow(
+    clippy::large_stack_frames,
+    reason = "the local STS read retains the UART response parser future"
+)]
+async fn read_position(
+    uart_rx: &mut UartRx<'_, Async>,
+    uart_tx: &mut UartTx<'_, Async>,
+    id: u8,
+) -> Result<i16, ServoFailure> {
+    validate_servo_id(id)?;
+    let status = send_sts_packet(
+        uart_rx,
+        uart_tx,
+        id,
+        STS_INSTRUCTION_READ,
+        &[STS_PRESENT_POSITION, 2],
+    )
+    .await?;
+    if status.payload_len != 2 {
+        return Err(ServoFailure::InvalidReply);
+    }
+    let value = u16::from_le_bytes([status.payload[0], status.payload[1]]);
+    Ok(decode_signed_15(value))
+}
+
+#[allow(
+    clippy::large_stack_frames,
+    reason = "the local STS write retains the UART transaction future"
+)]
+async fn write_register(
+    uart_rx: &mut UartRx<'_, Async>,
+    uart_tx: &mut UartTx<'_, Async>,
+    id: u8,
+    address: u8,
+    data: &[u8],
+) -> Result<(), ServoFailure> {
+    let mut parameters = [0_u8; 8];
+    if data.len() > parameters.len() - 1 {
+        return Err(ServoFailure::InvalidArgument);
+    }
+    parameters[0] = address;
+    parameters[1..=data.len()].copy_from_slice(data);
+    let status = send_sts_packet(
+        uart_rx,
+        uart_tx,
+        id,
+        STS_INSTRUCTION_WRITE,
+        &parameters[..=data.len()],
+    )
+    .await?;
+    if status.payload_len == 0 {
+        Ok(())
+    } else {
+        Err(ServoFailure::InvalidReply)
+    }
+}
+
+struct StsStatus {
+    payload: [u8; 64],
+    payload_len: usize,
+}
+
+#[allow(
+    clippy::large_stack_frames,
+    reason = "the local STS transaction retains UART I/O and timeout futures"
+)]
+async fn send_sts_packet(
+    uart_rx: &mut UartRx<'_, Async>,
+    uart_tx: &mut UartTx<'_, Async>,
+    id: u8,
+    instruction: u8,
+    parameters: &[u8],
+) -> Result<StsStatus, ServoFailure> {
+    let length = parameters
+        .len()
+        .checked_add(2)
+        .ok_or(ServoFailure::InvalidArgument)?;
+    let length = u8::try_from(length).map_err(|_| ServoFailure::InvalidArgument)?;
+    let mut packet = [0_u8; 16];
+    let packet_len = parameters.len() + 6;
+    if packet_len > packet.len() {
+        return Err(ServoFailure::InvalidArgument);
+    }
+    packet[..2].copy_from_slice(&STS_HEADER);
+    packet[2] = id;
+    packet[3] = length;
+    packet[4] = instruction;
+    packet[5..5 + parameters.len()].copy_from_slice(parameters);
+    packet[packet_len - 1] = checksum(&packet[2..packet_len - 1]);
+    uart_tx
+        .write_all(&packet[..packet_len])
+        .await
+        .map_err(|_| ServoFailure::Transport)?;
+
+    match with_timeout(STS_RESPONSE_TIMEOUT, read_sts_status(uart_rx, id)).await {
+        Ok(result) => result,
+        Err(_) => Err(ServoFailure::Timeout),
+    }
+}
+
+#[allow(
+    clippy::large_stack_frames,
+    reason = "the local STS status parser retains UART read futures"
+)]
+async fn read_sts_status(
+    uart_rx: &mut UartRx<'_, Async>,
+    expected_id: u8,
+) -> Result<StsStatus, ServoFailure> {
+    let mut previous = 0_u8;
+    let mut found_header = false;
+    for _ in 0..128 {
+        let byte = read_uart_byte(uart_rx).await?;
+        if previous == 0xff && byte == 0xff {
+            found_header = true;
+            break;
+        }
+        previous = byte;
+    }
+    if !found_header {
+        return Err(ServoFailure::InvalidReply);
+    }
+    let id = read_uart_byte(uart_rx).await?;
+    let length = read_uart_byte(uart_rx).await? as usize;
+    if id != expected_id || !(2..=66).contains(&length) {
+        return Err(ServoFailure::InvalidReply);
+    }
+    let error = read_uart_byte(uart_rx).await?;
+    let payload_len = length - 2;
+    let mut payload = [0_u8; 64];
+    for byte in &mut payload[..payload_len] {
+        *byte = read_uart_byte(uart_rx).await?;
+    }
+    let received_checksum = read_uart_byte(uart_rx).await?;
+    let mut checksum_bytes = [0_u8; 66];
+    checksum_bytes[0] = error;
+    checksum_bytes[1..1 + payload_len].copy_from_slice(&payload[..payload_len]);
+    if received_checksum != status_checksum(id, length as u8, &checksum_bytes[..1 + payload_len]) {
+        return Err(ServoFailure::InvalidReply);
+    }
+    if error != 0 {
+        return Err(ServoFailure::ReportedError(error));
+    }
+    Ok(StsStatus {
+        payload,
+        payload_len,
+    })
+}
+
+async fn read_uart_byte(uart_rx: &mut UartRx<'_, Async>) -> Result<u8, ServoFailure> {
+    let mut byte = [0_u8; 1];
+    uart_rx
+        .read_async(&mut byte)
+        .await
+        .map_err(|_| ServoFailure::Transport)?;
+    Ok(byte[0])
+}
+
+async fn resynchronize_uart(uart_rx: &mut UartRx<'_, Async>) {
+    // `read_async` is cancellation-safe in esp-hal.  Waiting for a short quiet
+    // interval and discarding any trailing bytes prevents an old STS response
+    // from being associated with the next local command.
+    let mut discarded = [0_u8; 64];
+    for _ in 0..4 {
+        if with_timeout(Duration::from_millis(2), uart_rx.read_async(&mut discarded))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+const fn validate_servo_id(id: u8) -> Result<(), ServoFailure> {
+    if id == 0 || id == STS_BROADCAST_ID || id == u8::MAX {
+        Err(ServoFailure::InvalidServoId)
+    } else {
+        Ok(())
+    }
+}
+
+const fn checksum(bytes: &[u8]) -> u8 {
+    let mut sum = 0_u8;
+    let mut index = 0;
+    while index < bytes.len() {
+        sum = sum.wrapping_add(bytes[index]);
+        index += 1;
+    }
+    !sum
+}
+
+const fn status_checksum(id: u8, length: u8, bytes: &[u8]) -> u8 {
+    let mut sum = id.wrapping_add(length);
+    let mut index = 0;
+    while index < bytes.len() {
+        sum = sum.wrapping_add(bytes[index]);
+        index += 1;
+    }
+    !sum
+}
+
+const fn decode_signed_15(value: u16) -> i16 {
+    if value & 0x8000 != 0 {
+        -((value & 0x7fff) as i16)
+    } else {
+        value as i16
+    }
+}
+
+#[allow(
+    clippy::large_stack_frames,
+    reason = "the debug tunnel retains both TCP-to-UART forwarding futures"
+)]
+async fn raw_tunnel(
+    socket: &mut TcpSocket<'_>,
+    uart_rx: &mut UartRx<'_, Async>,
+    uart_tx: &mut UartTx<'_, Async>,
+    network_to_uart_buffer: &mut [u8],
+    uart_to_network_buffer: &mut [u8],
+) -> BridgeExit {
+    let (mut tcp_rx, mut tcp_tx) = socket.split();
+    match select(
+        forward(
+            &mut tcp_rx,
+            uart_tx,
+            network_to_uart_buffer,
+            CopyDirection::NetworkToUart,
+        ),
+        forward(
+            uart_rx,
+            &mut tcp_tx,
+            uart_to_network_buffer,
+            CopyDirection::UartToNetwork,
+        ),
+    )
+    .await
+    {
+        Either::First(result) | Either::Second(result) => result,
     }
 }
 

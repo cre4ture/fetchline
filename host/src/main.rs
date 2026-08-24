@@ -24,6 +24,7 @@ use axum::{
     routing::get,
     Json,
 };
+use fetchline_protocol::{Command, ErrorCode, FRAME_LEN, Frame, Response as ControllerResponse};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -34,6 +35,7 @@ use tokio::{
 
 const DEFAULT_LISTEN_ADDRESS: &str = "0.0.0.0:8787";
 const SERVO_TIMEOUT: Duration = Duration::from_millis(750);
+const MAX_STALE_CONTROLLER_RESPONSES: usize = 32;
 const STS_HEADER: [u8; 2] = [0xff, 0xff];
 const STS_BROADCAST_ID: u8 = 0xfe;
 const STS_INSTRUCTION_READ: u8 = 0x02;
@@ -96,6 +98,7 @@ struct AppState {
     bridge: Arc<Mutex<Option<BridgeConnection>>>,
     config: Arc<Mutex<HostConfig>>,
     config_path: Arc<PathBuf>,
+    transport: TransportMode,
 }
 
 impl Default for AppState {
@@ -104,13 +107,24 @@ impl Default for AppState {
             bridge: Arc::new(Mutex::new(None)),
             config: Arc::new(Mutex::new(HostConfig::default())),
             config_path: Arc::new(PathBuf::from("fetchline-host-config.json")),
+            transport: TransportMode::Controller,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransportMode {
+    /// The default: the MCU terminates STS locally and exposes controller commands.
+    Controller,
+    /// Test-only compatibility path activated by the protocol debug command.
+    DebugRawTunnel,
 }
 
 struct BridgeConnection {
     peer: String,
     stream: TcpStream,
+    transport: TransportMode,
+    next_sequence: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -268,9 +282,7 @@ async fn main() {
     initialize_logging(&log_path).unwrap_or_else(|error| panic!("could not start logging: {error}"));
     log::info!("fetchline host starting; log file={}", log_path.display());
 
-    let listen_address = env::args()
-        .nth(1)
-        .unwrap_or_else(|| DEFAULT_LISTEN_ADDRESS.to_owned());
+    let (listen_address, transport) = startup_options();
     let listener = match TcpListener::bind(&listen_address).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -279,7 +291,9 @@ async fn main() {
         }
     };
 
-    log::info!("HTTP control panel listening on http://{listen_address}");
+    log::info!(
+        "HTTP control panel listening on http://{listen_address}; MCU transport={transport:?}"
+    );
 
     let config_path = host_config_path();
     let config = load_host_config(&config_path);
@@ -288,6 +302,7 @@ async fn main() {
         bridge: Arc::new(Mutex::new(None)),
         config: Arc::new(Mutex::new(config)),
         config_path: Arc::new(config_path),
+        transport,
     };
 
     let app = app(state);
@@ -300,6 +315,22 @@ async fn main() {
     {
         log::error!("HTTP server stopped unexpectedly: {error}");
     }
+}
+
+fn startup_options() -> (String, TransportMode) {
+    let mut listen_address = None;
+    let mut transport = TransportMode::Controller;
+    for argument in env::args().skip(1) {
+        if argument == "--debug-raw-tunnel" {
+            transport = TransportMode::DebugRawTunnel;
+        } else if listen_address.replace(argument).is_some() {
+            panic!("usage: fetchline-host [--debug-raw-tunnel] [listen-address]");
+        }
+    }
+    (
+        listen_address.unwrap_or_else(|| DEFAULT_LISTEN_ADDRESS.to_owned()),
+        transport,
+    )
 }
 
 fn app(state: AppState) -> Router {
@@ -661,7 +692,11 @@ async fn connect(state: &AppState, host: String, port: u16) -> ServerMessage {
     if let Some(previous) = bridge.take() {
         log::info!("closing MCU TCP connection peer={} before switching to peer={peer}", previous.peer);
     }
-    log::info!("opening MCU TCP connection peer={peer} timeout_ms={}", SERVO_TIMEOUT.as_millis());
+    let transport = state.transport;
+    log::info!(
+        "opening MCU TCP connection peer={peer} transport={transport:?} timeout_ms={}",
+        SERVO_TIMEOUT.as_millis()
+    );
     let started = Instant::now();
     match timeout(SERVO_TIMEOUT, TcpStream::connect(&peer)).await {
         Ok(Ok(stream)) => {
@@ -672,12 +707,29 @@ async fn connect(state: &AppState, host: String, port: u16) -> ServerMessage {
                     bridge_connected: false,
                 };
             }
-            *bridge = Some(BridgeConnection {
+            let mut connection = BridgeConnection {
                 peer: peer.clone(),
                 stream,
-            });
+                transport: TransportMode::Controller,
+                next_sequence: 1,
+            };
+            let setup = match transport {
+                TransportMode::Controller => connection
+                    .controller_request(Command::Ping)
+                    .await
+                    .and_then(expect_controller_ack),
+                TransportMode::DebugRawTunnel => connection.open_raw_tunnel().await,
+            };
+            if let Err(error) = setup {
+                log::warn!("MCU protocol setup failed peer={peer} transport={transport:?}: {error}");
+                return ServerMessage::Error {
+                    message: error,
+                    bridge_connected: false,
+                };
+            }
+            *bridge = Some(connection);
             log::info!(
-                "MCU TCP connection established peer={peer} elapsed_ms={}",
+                "MCU TCP connection established peer={peer} transport={transport:?} elapsed_ms={}",
                 started.elapsed().as_millis()
             );
             ServerMessage::Connected { address: peer }
@@ -717,6 +769,31 @@ async fn start_motor(
         return Err("Motor speed must be between 0 and 4095".to_owned());
     }
 
+    if connection.transport == TransportMode::Controller {
+        connection
+            .controller_request(Command::StartMotor {
+                id,
+                counter_clockwise: matches!(direction, Direction::Counterclockwise),
+                speed,
+                acceleration,
+            })
+            .await
+            .and_then(expect_controller_ack)?;
+        return Ok(ServerMessage::Complete {
+            action: "motor_started",
+        });
+    }
+    raw_start_motor(connection, id, speed, acceleration, direction).await
+}
+
+async fn raw_start_motor(
+    connection: &mut BridgeConnection,
+    id: u8,
+    speed: u16,
+    acceleration: u8,
+    direction: Direction,
+) -> Result<ServerMessage, String> {
+
     // Mode is non-volatile on STS servos. Re-sending it is deliberate: a power
     // cycle or another tool may have returned this servo to position mode.
     connection.write_register(id, STS_MODE, &[1]).await?;
@@ -741,6 +818,22 @@ async fn start_motor(
 
 async fn stop_motor(connection: &mut BridgeConnection, id: u8) -> Result<ServerMessage, String> {
     validate_id(id)?;
+    if connection.transport == TransportMode::Controller {
+        connection
+            .controller_request(Command::StopMotor { id })
+            .await
+            .and_then(expect_controller_ack)?;
+        return Ok(ServerMessage::Complete {
+            action: "motor_stopped",
+        });
+    }
+    raw_stop_motor(connection, id).await
+}
+
+async fn raw_stop_motor(
+    connection: &mut BridgeConnection,
+    id: u8,
+) -> Result<ServerMessage, String> {
     let command = [0_u8; 7];
     // In continuous mode a goal speed of zero commands a controlled stop while
     // leaving torque enabled.
@@ -767,6 +860,31 @@ async fn move_position(
         return Err("Torque limit must be between 0 and 1000".to_owned());
     }
 
+    if connection.transport == TransportMode::Controller {
+        connection
+            .controller_request(Command::SetPosition {
+                id,
+                position,
+                acceleration,
+                torque_limit,
+            })
+            .await
+            .and_then(expect_controller_ack)?;
+        return Ok(ServerMessage::Complete {
+            action: "position_commanded",
+        });
+    }
+    raw_move_position(connection, id, position, acceleration, torque_limit).await
+}
+
+async fn raw_move_position(
+    connection: &mut BridgeConnection,
+    id: u8,
+    position: u16,
+    acceleration: u8,
+    torque_limit: u16,
+) -> Result<ServerMessage, String> {
+
     // Enable holding torque, then set the RAM torque limit. The limit remains
     // in effect after the servo reaches the requested position.
     connection
@@ -792,6 +910,24 @@ async fn move_position(
 
 async fn read_position(connection: &mut BridgeConnection, id: u8) -> Result<i16, String> {
     validate_id(id)?;
+    if connection.transport == TransportMode::Controller {
+        return match connection.controller_request(Command::ReadPosition { id }).await? {
+            ControllerResponse::Position {
+                id: response_id,
+                position,
+            } if response_id == id => Ok(position),
+            ControllerResponse::Position {
+                id: response_id, ..
+            } => Err(format!(
+                "MCU returned a position for servo {response_id}, but servo {id} was requested"
+            )),
+            response => Err(format!("MCU returned an unexpected response to position read: {response:?}")),
+        };
+    }
+    raw_read_position(connection, id).await
+}
+
+async fn raw_read_position(connection: &mut BridgeConnection, id: u8) -> Result<i16, String> {
     let bytes = connection
         .read_register(id, STS_PRESENT_POSITION, 2)
         .await?;
@@ -827,13 +963,16 @@ async fn read_positions(
     Ok(ServerMessage::Positions { positions, errors })
 }
 
-/// Servo replies are independent of the TCP transport. Retain the bridge after
-/// a servo timeout or malformed/error reply so the remaining servos remain
-/// controllable. Broken TCP I/O is the only case that requires reconnecting.
+/// Controller-mode responses carry a sequence number, so a delayed response
+/// can be discarded safely. Raw debug tunnelling retains the legacy behavior.
+/// Broken TCP I/O is the only case that requires reconnecting.
 fn connection_is_usable_after(error: &str) -> bool {
     !error.starts_with("Timed out sending command to the MCU")
         && !error.starts_with("Could not send command to the MCU")
         && !error.starts_with("Could not read STS servo reply")
+        && !error.starts_with("Could not send a controller command to the MCU")
+        && !error.starts_with("Could not read an MCU controller response")
+        && !error.starts_with("MCU sent an invalid controller frame")
 }
 
 fn validate_id(id: u8) -> Result<(), String> {
@@ -845,6 +984,49 @@ fn validate_id(id: u8) -> Result<(), String> {
 }
 
 impl BridgeConnection {
+    async fn controller_request(&mut self, command: Command) -> Result<ControllerResponse, String> {
+        if self.transport != TransportMode::Controller {
+            return Err("the MCU connection is in debug raw-tunnel mode".to_owned());
+        }
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        let frame = Frame::command(sequence, command).encode();
+        write_controller_frame(&mut self.stream, &frame).await?;
+
+        for _ in 0..MAX_STALE_CONTROLLER_RESPONSES {
+            let frame = read_controller_frame(&mut self.stream).await?;
+            let response_sequence = frame.sequence();
+            if response_sequence != sequence {
+                log::warn!(
+                    "discarding stale MCU controller response peer={} expected_sequence={sequence} response_sequence={response_sequence}",
+                    self.peer
+                );
+                continue;
+            }
+            return match frame.as_response() {
+                Ok(ControllerResponse::Error { code, detail }) => {
+                    Err(controller_error_message(code, detail))
+                }
+                Ok(response) => Ok(response),
+                Err(error) => Err(format!("MCU sent an invalid controller response: {error:?}")),
+            };
+        }
+        Err("MCU sent too many stale controller responses".to_owned())
+    }
+
+    async fn open_raw_tunnel(&mut self) -> Result<(), String> {
+        match self.controller_request(Command::OpenRawTunnel).await? {
+            ControllerResponse::RawTunnelReady => {
+                self.transport = TransportMode::DebugRawTunnel;
+                log::warn!("MCU debug raw tunnel enabled peer={}", self.peer);
+                Ok(())
+            }
+            response => Err(format!(
+                "MCU returned an unexpected response while enabling the debug raw tunnel: {response:?}"
+            )),
+        }
+    }
+
     async fn write_register(&mut self, id: u8, address: u8, data: &[u8]) -> Result<(), String> {
         let mut parameters = Vec::with_capacity(data.len() + 1);
         parameters.push(address);
@@ -923,6 +1105,42 @@ impl BridgeConnection {
         }
         Ok(payload.to_vec())
     }
+}
+
+fn expect_controller_ack(response: ControllerResponse) -> Result<(), String> {
+    match response {
+        ControllerResponse::Ack => Ok(()),
+        response => Err(format!("MCU returned an unexpected controller response: {response:?}")),
+    }
+}
+
+fn controller_error_message(code: ErrorCode, detail: u16) -> String {
+    match code {
+        ErrorCode::UnsupportedCommand => "The MCU does not support this controller command".to_owned(),
+        ErrorCode::InvalidServoId => "The MCU rejected the servo ID".to_owned(),
+        ErrorCode::InvalidArgument => "The MCU rejected an out-of-range controller argument".to_owned(),
+        ErrorCode::ServoTimeout => "The MCU timed out waiting for an STS servo reply".to_owned(),
+        ErrorCode::InvalidServoReply => "The MCU received an invalid STS servo reply".to_owned(),
+        ErrorCode::ServoReportedError => format!("Servo reported STS error 0x{detail:02x}"),
+        ErrorCode::ServoTransport => "The MCU could not communicate with the STS UART".to_owned(),
+        ErrorCode::InvalidRequest => "The MCU rejected the controller request".to_owned(),
+    }
+}
+
+async fn write_controller_frame(stream: &mut TcpStream, bytes: &[u8; FRAME_LEN]) -> Result<(), String> {
+    timeout(SERVO_TIMEOUT, stream.write_all(bytes))
+        .await
+        .map_err(|_| "Timed out sending a controller command to the MCU".to_owned())?
+        .map_err(|error| format!("Could not send a controller command to the MCU: {error}"))
+}
+
+async fn read_controller_frame(stream: &mut TcpStream) -> Result<Frame, String> {
+    let mut bytes = [0_u8; FRAME_LEN];
+    timeout(SERVO_TIMEOUT, stream.read_exact(&mut bytes))
+        .await
+        .map_err(|_| "Timed out waiting for an MCU controller response".to_owned())?
+        .map_err(|error| format!("Could not read an MCU controller response: {error}"))?;
+    Frame::decode(bytes).map_err(|error| format!("MCU sent an invalid controller frame: {error:?}"))
 }
 
 async fn find_header(stream: &mut TcpStream) -> Result<(), String> {
@@ -1134,15 +1352,67 @@ mod tests {
             stream.write_all(&status_packet(1, &[])).await.unwrap();
         });
 
-        let stream = TcpStream::connect(address).await.unwrap();
-        let mut bridge = BridgeConnection {
-            peer: address.to_string(),
-            stream,
-        };
+        let mut bridge = raw_bridge(address).await;
         start_motor(&mut bridge, 1, 1024, 20, Direction::Clockwise)
             .await
             .unwrap();
         servo.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn controller_mode_uses_a_high_level_command_and_discards_a_stale_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mcu = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = receive_controller_frame(&mut stream).await;
+            assert_eq!(
+                request.as_command(),
+                Ok(Command::SetPosition {
+                    id: 5,
+                    position: 1625,
+                    acceleration: 20,
+                    torque_limit: 1000,
+                })
+            );
+            stream
+                .write_all(&Frame::response(0, ControllerResponse::Ack).encode())
+                .await
+                .unwrap();
+            stream
+                .write_all(&Frame::response(request.sequence(), ControllerResponse::Ack).encode())
+                .await
+                .unwrap();
+        });
+
+        let mut bridge = controller_bridge(address).await;
+        move_position(&mut bridge, 5, 1625, 20, 1000)
+            .await
+            .unwrap();
+        mcu.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn debug_raw_tunnel_is_enabled_by_an_explicit_controller_command() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mcu = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = receive_controller_frame(&mut stream).await;
+            assert_eq!(request.as_command(), Ok(Command::OpenRawTunnel));
+            stream
+                .write_all(
+                    &Frame::response(request.sequence(), ControllerResponse::RawTunnelReady)
+                        .encode(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut bridge = controller_bridge(address).await;
+        bridge.open_raw_tunnel().await.unwrap();
+        assert_eq!(bridge.transport, TransportMode::DebugRawTunnel);
+        mcu.await.unwrap();
     }
 
     #[tokio::test]
@@ -1161,11 +1431,7 @@ mod tests {
                 .unwrap();
         });
 
-        let stream = TcpStream::connect(address).await.unwrap();
-        let mut bridge = BridgeConnection {
-            peer: address.to_string(),
-            stream,
-        };
+        let mut bridge = raw_bridge(address).await;
         assert_eq!(read_position(&mut bridge, 2).await.unwrap(), 0x1234);
         servo.await.unwrap();
     }
@@ -1268,11 +1534,7 @@ mod tests {
             stream.write_all(&status_packet(4, &[4, 0])).await.unwrap();
         });
 
-        let stream = TcpStream::connect(address).await.unwrap();
-        let mut bridge = BridgeConnection {
-            peer: address.to_string(),
-            stream,
-        };
+        let mut bridge = raw_bridge(address).await;
         let ServerMessage::Positions { positions, errors } =
             read_positions(&mut bridge, &[2, 3, 4]).await.unwrap()
         else {
@@ -1291,25 +1553,26 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let state = AppState::default();
-
-        assert!(matches!(
-            connect(&state, "127.0.0.1".to_owned(), port).await,
-            ServerMessage::Connected { .. }
-        ));
-        let (_stream, _) = timeout(Duration::from_millis(50), listener.accept())
-            .await
-            .expect("first connection should reach the MCU")
-            .unwrap();
-
-        assert!(matches!(
-            connect(&state, "127.0.0.1".to_owned(), port).await,
-            ServerMessage::Connected { .. }
-        ));
-        assert!(
-            timeout(Duration::from_millis(50), listener.accept())
+        let controller = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let frame = receive_controller_frame(&mut stream).await;
+            assert_eq!(frame.as_command(), Ok(Command::Ping));
+            stream
+                .write_all(&Frame::response(frame.sequence(), ControllerResponse::Ack).encode())
                 .await
-                .is_err()
-        );
+                .unwrap();
+        });
+
+        assert!(matches!(
+            connect(&state, "127.0.0.1".to_owned(), port).await,
+            ServerMessage::Connected { .. }
+        ));
+        controller.await.unwrap();
+
+        assert!(matches!(
+            connect(&state, "127.0.0.1".to_owned(), port).await,
+            ServerMessage::Connected { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1335,13 +1598,29 @@ mod tests {
             bridge: Arc::new(Mutex::new(None)),
             config: Arc::new(Mutex::new(HostConfig::default())),
             config_path: Arc::new(config_path),
+            transport: TransportMode::Controller,
         }
     }
 
     async fn bridge_for(address: SocketAddr) -> BridgeConnection {
+        raw_bridge(address).await
+    }
+
+    async fn raw_bridge(address: SocketAddr) -> BridgeConnection {
         BridgeConnection {
             peer: address.to_string(),
             stream: TcpStream::connect(address).await.unwrap(),
+            transport: TransportMode::DebugRawTunnel,
+            next_sequence: 1,
+        }
+    }
+
+    async fn controller_bridge(address: SocketAddr) -> BridgeConnection {
+        BridgeConnection {
+            peer: address.to_string(),
+            stream: TcpStream::connect(address).await.unwrap(),
+            transport: TransportMode::Controller,
+            next_sequence: 1,
         }
     }
 
@@ -1353,6 +1632,12 @@ mod tests {
         let mut remaining = vec![0_u8; length];
         stream.read_exact(&mut remaining).await.unwrap();
         [header_and_fixed.to_vec(), remaining].concat()
+    }
+
+    async fn receive_controller_frame(stream: &mut TcpStream) -> Frame {
+        let mut bytes = [0_u8; FRAME_LEN];
+        stream.read_exact(&mut bytes).await.unwrap();
+        Frame::decode(bytes).unwrap()
     }
 
     fn status_packet(id: u8, payload: &[u8]) -> Vec<u8> {

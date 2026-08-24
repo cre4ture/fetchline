@@ -18,6 +18,7 @@ let socket;
 let connectedToMcu = false;
 const currentPositions = new Map();
 const queuedMoves = new Map();
+const lastSentPositions = new Map();
 
 async function loadConfig() {
   try {
@@ -223,14 +224,17 @@ function queuePositionMove(index, position, flush = false) {
   document.querySelector(`#position-value-${index}`).value = position;
   const pending = queuedMoves.get(index);
   if (pending) clearTimeout(pending);
+  if (flush && !pending && lastSentPositions.get(index) === position) return;
   const sendMove = () => {
     queuedMoves.delete(index);
     const joint = config.joints[index];
     if (!joint.enabled) return;
+    const target = currentPositions.get(index);
+    lastSentPositions.set(index, target);
     send({
       type: "move_position",
       id: joint.id,
-      position: currentPositions.get(index),
+      position: target,
       acceleration: joint.acceleration,
       torque_limit: torqueLimit(joint.torquePercent),
     });

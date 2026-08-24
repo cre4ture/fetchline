@@ -1,22 +1,25 @@
 # fetchline
 
 Bare-metal Rust firmware for the EGBO mini ESP32-C3 board with its built-in
-0.42-inch OLED. It connects a Feetech FE-URT-2 adapter to Wi-Fi, allowing
-Windows servo software to use a virtual COM port as though the STS servo bus
-were connected locally.
+0.42-inch OLED. It connects a Feetech FE-URT-2 adapter to Wi-Fi and exposes a
+versioned, high-level controller API for STS/SMS servos.
 
-The bridge is transparent and binary-safe:
+The normal control path terminates the time-sensitive STS protocol on the MCU:
 
 ```text
-Windows COM port <-> raw TCP port 3333 <-> ESP32-C3 UART1 <-> FE-URT-2 <-> STS servos
+Browser <-> Linux host <-> controller API / Wi-Fi <-> ESP32-C3 <-> UART1 <-> FE-URT-2 <-> STS servos
 ```
+
+The MCU owns the UART transaction, local response deadline, and recovery from
+late STS replies. Wi-Fi carries only controller requests and sequenced results,
+so a delayed network packet cannot be mistaken for a later servo response.
 
 ## Linux host control panel
 
 The `host/` directory contains a Linux PC application with a browser UI for
-direct manual control. It owns the one raw-TCP connection to the MCU and serves
-the UI on the local machine, so no browser extension and no virtual COM driver
-is required.
+direct manual control. It owns the one controller-API connection to the MCU and
+serves the UI on the local machine, so no browser extension and no virtual COM
+driver is required.
 
 It controls Feetech **STS/SMS-compatible** servos with the normal STS protocol:
 
@@ -62,24 +65,45 @@ just host-logs
 ```
 
 The normal log records host startup, browser WebSocket connect/disconnect,
-MCU TCP connection attempts and failures, and every servo action with its
-elapsed time. Individual servo timeouts, corrupt replies, and servo-reported
-STS errors are logged with the servo ID while retaining the MCU TCP connection
-when possible. For individual STS packet metadata, start the panel with:
+MCU controller-API connection attempts and failures, and every servo action
+with its elapsed time. The MCU reports local STS timeouts, invalid replies, and
+servo errors as structured controller results. Delayed API responses carry a
+sequence number and are discarded by the host rather than being associated with
+a later action. For controller-frame diagnostics, start the panel with:
 
 ```sh
 just host-debug
 ```
 
 Packet payloads are intentionally not logged. This avoids filling the log
-during live slider movement while retaining the IDs, instructions, errors, and
-timing needed to distinguish a host/MCU network failure from a servo-bus
-failure.
+during live slider movement while retaining the IDs, actions, errors, and timing
+needed to distinguish a host/MCU network failure from a servo-bus failure.
 
-Only one program may use the MCU TCP bridge. Close the virtual COM software and
-any other `fetchline-host` page before connecting this panel. The host has no
+Only one program may use the MCU controller connection. The host has no
 authentication: every device that can reach its port can command physical
 actuators. Keep it on a trusted LAN, or firewall the port / use a VPN.
+
+### Controller API
+
+Port `3333` speaks Fetchline Controller Protocol v1: fixed 16-byte binary
+frames beginning with `FL`, protocol version `1`, a message code, and a
+little-endian request sequence. The normal requests are `Ping`, `StartMotor`,
+`StopMotor`, `SetPosition`, and `ReadPosition`. The MCU replies with the same
+sequence and an acknowledgement, position, or stable error code. This protocol
+is implemented in the shared [`protocol/`](protocol/) crate.
+
+The raw UART tunnel exists only for special tests. A client on a controller
+connection must explicitly send the `OpenRawTunnel` debug command; after the
+MCU replies `RawTunnelReady`, that **same TCP session** becomes an unframed raw
+UART tunnel until it disconnects. The next connection always starts in
+controller mode. The included host can request this mode with:
+
+```sh
+just host-debug-tunnel
+```
+
+Do not use the debug tunnel for normal actuation: it intentionally restores the
+old raw request/reply timing characteristics.
 
 It uses DHCP, reconnects Wi-Fi automatically, accepts one TCP client at a time,
 and keeps UART1 fixed at 1,000,000 baud, 8 data bits, no parity, and 1 stop bit.
@@ -99,7 +123,7 @@ assigned address is also printed to the USB serial monitor.
 | Servo UART | UART1, 1,000,000 baud, 8N1 |
 | Servo UART RX | GPIO20, board pin `RX` |
 | Servo UART TX | GPIO21, board pin `TX` |
-| Network endpoint | raw TCP server, port 3333 |
+| Network endpoint | Controller Protocol v1 TCP server, port 3333 |
 
 The OLED address is presumed from this board family because it was not listed
 by the seller. If the screen stays blank, scan the I2C bus and try `0x3d` in
@@ -179,46 +203,28 @@ not a 5 GHz-only network. If automatic download mode fails, hold **BOOT**, tap
 After DHCP completes, the USB log contains a line similar to:
 
 ```text
-Wi-Fi ready: IP 192.168.1.123/24, raw TCP port 3333
+Wi-Fi ready: IP 192.168.1.123/24, controller TCP port 3333
 ```
 
-Reserve that address for the board in the router's DHCP settings so the Windows
-virtual-COM configuration remains stable.
+Reserve that address for the board in the router's DHCP settings so controller
+clients can reconnect to a stable endpoint.
 
-## Windows virtual COM port
+## Raw UART debug tunnel
 
-[HW VSP3 Single](https://www.hw-group.com/software/hw-vsp3-virtual-serial-port)
-is one Windows virtual serial port driver that can redirect a COM port to an
-IP address and TCP port. Install it as an administrator, then:
-
-1. Check connectivity in PowerShell:
-
-   ```powershell
-   Test-NetConnection 192.168.1.123 -Port 3333
-   ```
-
-2. Open **Virtual Serial Port** in HW VSP3 and choose an unused port such as
-   `COM9`.
-3. Enter the ESP32-C3's DHCP address and port `3333`.
-4. Use normal client mode, turn off **TCP server mode**, and click **Create COM**.
-5. Leave **NVT**, **NVT filter**, and **NVT port setup** disabled. Fetchline uses
-   transparent raw TCP, not Telnet or RFC 2217 control sequences.
-6. In the Feetech application, open that COM port at **1,000,000 baud, 8N1**.
-
-The firmware's UART parameters are fixed; changing the baud rate in Windows
-does not reconfigure the remote UART. A detailed example of creating a COM port
-from an IP address and port is available in the
-[Teltonika HW VSP3 guide](https://wiki.teltonika-networks.com/view/Connect_Serial_Devices_as_Virtual_COM_Ports_using_TRB145_and_HW_VSP3).
-
-Only one Windows application can open a COM port, and fetchline accepts only one
-TCP client. Close Feetech tools, terminals, or previous VSP connections that may
-already own it before troubleshooting a connection.
+The old transparent UART bridge is no longer the default service. It is a
+debug-only session enabled by `OpenRawTunnel`, then ended on TCP disconnect.
+Generic virtual-COM tools cannot use it by merely opening port 3333 because
+they do not send the required controller command first. Use
+`just host-debug-tunnel` for controlled browser-based testing, or a test client
+that implements the documented debug handshake and keeps that one TCP session
+open.
 
 ## Security
 
-Port 3333 has no authentication or encryption. Every byte received is sent to
-physical actuators. Use this firmware only on a trusted private LAN or through a
-VPN. Never expose or port-forward TCP 3333 to the public internet.
+Port 3333 has no authentication or encryption. Controller commands can move
+physical actuators, and the debug command enables an unrestricted raw UART
+tunnel for its TCP session. Use this firmware only on a trusted private LAN or
+through a VPN. Never expose or port-forward TCP 3333 to the public internet.
 
 ## Development checks
 
