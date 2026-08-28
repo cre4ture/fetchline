@@ -17,6 +17,7 @@ use embassy_sync::{
     blocking_mutex::{Mutex as BlockingMutex, raw::CriticalSectionRawMutex},
     mutex::Mutex,
     signal::Signal,
+    watch::Watch,
 };
 use embassy_time::{Duration, Timer, with_timeout};
 use embedded_graphics::{
@@ -57,6 +58,10 @@ use alloc::{boxed::Box, format};
 use core::cell::Cell;
 
 const TCP_BUFFER_SIZE: usize = 4096;
+// One active controller session and one standby listener let a replacement
+// connection take over even if the previous TCP peer disappeared silently.
+const CONTROLLER_SOCKET_SLOTS: usize = 2;
+const CONTROLLER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const COPY_BUFFER_SIZE: usize = 512;
 const JSON_RPC_BUFFER_SIZE: usize = 1024;
 const MAX_POSITION_BATCH: usize = 6;
@@ -177,6 +182,42 @@ impl RawTunnelControl {
 }
 
 static RAW_TUNNEL: RawTunnelControl = RawTunnelControl::new();
+
+/// Tracks the controller session that is currently allowed to issue commands.
+///
+/// Two TCP sockets can be established at once, but the STS bus must still have
+/// exactly one owner. A newly upgraded WebSocket claims the next generation;
+/// the previous generation is notified and closes its session before accepting
+/// another controller command.
+struct ControllerOwnership {
+    current: BlockingMutex<CriticalSectionRawMutex, Cell<u64>>,
+    changes: Watch<CriticalSectionRawMutex, u64, CONTROLLER_SOCKET_SLOTS>,
+}
+
+impl ControllerOwnership {
+    const fn new() -> Self {
+        Self {
+            current: BlockingMutex::new(Cell::new(0)),
+            changes: Watch::new(),
+        }
+    }
+
+    fn claim(&self) -> u64 {
+        let generation = self.current.lock(|current| {
+            let generation = current.get().wrapping_add(1);
+            current.set(generation);
+            generation
+        });
+        self.changes.sender().send(generation);
+        generation
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.current.lock(|current| current.get() == generation)
+    }
+}
+
+static CONTROLLER_OWNERSHIP: ControllerOwnership = ControllerOwnership::new();
 
 #[derive(Deserialize)]
 struct JsonRpcRequest<'a> {
@@ -480,7 +521,11 @@ async fn main(spawner: Spawner) -> ! {
     let uart_tx = mk_static!(SharedUartTx, Mutex::new(uart_tx));
     spawner.spawn(
         services::controller_service(stack, uart_rx, uart_tx)
-            .expect("failed to allocate JSON-RPC controller task"),
+            .expect("failed to allocate first JSON-RPC controller task"),
+    );
+    spawner.spawn(
+        services::controller_service(stack, uart_rx, uart_tx)
+            .expect("failed to allocate replacement JSON-RPC controller task"),
     );
     spawner.spawn(
         services::raw_tunnel_service(stack, uart_rx, uart_tx)
@@ -499,7 +544,7 @@ async fn main(spawner: Spawner) -> ! {
 mod services {
     use super::*;
 
-    #[embassy_executor::task]
+    #[embassy_executor::task(pool_size = 2)]
     #[allow(
         clippy::large_stack_frames,
         reason = "the JSON-RPC service keeps one WebSocket and its TCP buffers for its task lifetime"
@@ -528,9 +573,21 @@ mod services {
                 "controller TCP client connected: {:?}",
                 socket.remote_endpoint()
             );
-            match websocket::upgrade(&mut socket).await {
-                Ok(()) => controller_session(&mut socket, uart_rx, uart_tx).await,
-                Err(error) => warn!("rejected controller WebSocket handshake: {error:?}"),
+            match with_timeout(
+                CONTROLLER_HANDSHAKE_TIMEOUT,
+                websocket::upgrade(&mut socket),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    let generation = CONTROLLER_OWNERSHIP.claim();
+                    info!(
+                        "controller WebSocket session claimed generation {generation}; newest session owns the STS bus"
+                    );
+                    controller_session(&mut socket, uart_rx, uart_tx, generation).await;
+                }
+                Ok(Err(error)) => warn!("rejected controller WebSocket handshake: {error:?}"),
+                Err(_) => warn!("timed out upgrading controller WebSocket"),
             }
             release_tcp_socket(&mut socket).await;
         }
@@ -544,21 +601,50 @@ mod services {
         socket: &mut TcpSocket<'_>,
         uart_rx: &'static SharedUartRx,
         uart_tx: &'static SharedUartTx,
+        generation: u64,
     ) {
         let mut request_buffer = [0_u8; JSON_RPC_BUFFER_SIZE];
         let mut response_buffer = [0_u8; JSON_RPC_BUFFER_SIZE];
+        let mut ownership_updates = CONTROLLER_OWNERSHIP
+            .changes
+            .receiver()
+            .expect("controller ownership receiver slots match TCP socket slots");
+        let announced_generation = ownership_updates.get().await;
+        if announced_generation != generation {
+            info!(
+                "controller WebSocket generation {generation} was superseded during setup by generation {announced_generation}"
+            );
+            return;
+        }
         loop {
-            let request = match websocket::read_text(socket, &mut request_buffer).await {
-                Ok(request) => request,
-                Err(websocket::Error::Closed) => {
+            let request = match select(
+                websocket::read_text(socket, &mut request_buffer),
+                ownership_updates.changed(),
+            )
+            .await
+            {
+                Either::First(Ok(request)) => request,
+                Either::First(Err(websocket::Error::Closed)) => {
                     info!("controller WebSocket client disconnected");
                     return;
                 }
-                Err(error) => {
+                Either::First(Err(error)) => {
                     warn!("controller WebSocket session ended: {error:?}");
                     return;
                 }
+                Either::Second(newer_generation) => {
+                    info!(
+                        "controller WebSocket generation {generation} replaced by generation {newer_generation}"
+                    );
+                    return;
+                }
             };
+            if !CONTROLLER_OWNERSHIP.is_current(generation) {
+                info!(
+                    "controller WebSocket generation {generation} lost ownership before processing a command"
+                );
+                return;
+            }
             debug!(
                 "controller WebSocket request received bytes={}",
                 request.len()
@@ -568,6 +654,12 @@ mod services {
             else {
                 continue;
             };
+            if !CONTROLLER_OWNERSHIP.is_current(generation) {
+                info!(
+                    "controller WebSocket generation {generation} lost ownership while processing a command"
+                );
+                return;
+            }
             if let Err(error) =
                 websocket::write_text(socket, &response_buffer[..response_len]).await
             {

@@ -7,6 +7,14 @@ transactions locally; Wi-Fi carries only high-level commands and results.
 Requests use numeric JSON-RPC IDs. The host uses the ID to discard late replies
 instead of ever associating them with a newer servo command.
 
+## Controller connection policy
+
+The MCU has two fixed TCP/WebSocket controller slots. This permits a newly
+connected host to take over even if the previous peer vanished without a clean
+TCP close. Once its WebSocket upgrade succeeds, the newest session becomes the
+only session allowed to execute controller commands; the prior session is
+closed. At most one STS command is executed at a time.
+
 | Method | Named parameters | Result |
 | --- | --- | --- |
 | `system.ping` | none | `{ "ready": true }` |

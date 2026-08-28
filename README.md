@@ -17,9 +17,9 @@ so a delayed network packet cannot be mistaken for a later servo response.
 ## Linux host control panel
 
 The `host/` directory contains a Linux PC application with a browser UI for
-direct manual control. It owns the one controller-API connection to the MCU and
-serves the UI on the local machine, so no browser extension and no virtual COM
-driver is required.
+direct manual control. It normally owns the persistent controller-API
+connection to the MCU and serves the UI on the local machine, so no browser
+extension and no virtual COM driver is required.
 
 It controls Feetech **STS/SMS-compatible** servos with the normal STS protocol:
 
@@ -83,9 +83,12 @@ Packet payloads are intentionally not logged. This avoids filling the log
 during live slider movement while retaining the IDs, actions, errors, and timing
 needed to distinguish a host/MCU network failure from a servo-bus failure.
 
-Only one program may use the MCU controller connection. The host has no
-authentication: every device that can reach its port can command physical
-actuators. Keep it on a trusted LAN, or firewall the port / use a VPN.
+The MCU keeps two fixed controller TCP slots so a new connection can replace a
+peer that disappeared without a clean TCP close. Only the newest successfully
+upgraded WebSocket session may execute controller commands; it closes the
+previous session. The host has no authentication: every device that can reach
+the MCU can therefore take over physical actuators. Keep it on a trusted LAN,
+or firewall the port / use a VPN.
 
 ### Controller API
 
@@ -139,8 +142,9 @@ It replaces the direct MCU-to-FE-URT2 UART path for the duration of the test;
 do not leave that physical UART path connected in parallel with both USB UART
 adapters.
 
-It uses DHCP, reconnects Wi-Fi automatically, accepts one TCP client at a time,
-and keeps UART1 fixed at 1,000,000 baud, 8 data bits, no parity, and 1 stop bit.
+It uses DHCP, reconnects Wi-Fi automatically, keeps up to two controller TCP
+sessions while the newest one owns the STS bus, and keeps UART1 fixed at
+1,000,000 baud, 8 data bits, no parity, and 1 stop bit.
 After DHCP completes, the OLED shows the assigned IPv4 address across two lines
 and keeps it visible while clients connect and disconnect. Startup or
 configuration diagnostics are shown only until an address is available. The

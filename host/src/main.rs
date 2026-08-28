@@ -706,19 +706,36 @@ async fn connect(state: &AppState, host: String, port: u16) -> ServerMessage {
     }
 
     let peer = format!("{host}:{port}");
-    // Reuse the existing WebSocket session to the selected MCU. The MCU accepts
-    // one controller client at a time, while the raw debug endpoint is separate.
+    // Reuse a live WebSocket session to the selected MCU. A TCP peer can vanish
+    // without the host immediately learning about it, so verify a reused
+    // controller session before reporting it as connected.
     let mut bridge = state.bridge.lock().await;
     if bridge
         .as_ref()
         .is_some_and(|connection| connection.peer == peer)
     {
-        log::info!("reusing existing MCU TCP connection peer={peer}");
-        return ServerMessage::Connected { address: peer };
+        let reuse_result = match bridge.as_mut().expect("checked for an existing bridge") {
+            connection if connection.is_controller() => connection
+                .controller_request("system.ping", serde_json::json!({}))
+                .await
+                .and_then(expect_controller_ready),
+            // Raw debug mode is intentionally a transparent TCP stream, so it
+            // has no controller RPC health check to send here.
+            _ => Ok(()),
+        };
+        match reuse_result {
+            Ok(()) => {
+                log::info!("reusing healthy MCU TCP connection peer={peer}");
+                return ServerMessage::Connected { address: peer };
+            }
+            Err(error) => {
+                log::warn!("discarding unhealthy MCU TCP connection peer={peer}: {error}");
+            }
+        }
     }
 
-    // Switching targets deliberately closes the previous controller session
-    // before opening the new WebSocket connection.
+    // Switching targets, or replacing an unhealthy session, deliberately
+    // closes the previous controller connection before opening a new one.
     if let Some(previous) = bridge.take() {
         log::info!("closing MCU TCP connection peer={} before switching to peer={peer}", previous.peer);
     }
@@ -1811,11 +1828,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconnecting_to_the_same_mcu_reuses_its_websocket_client() {
+    async fn reconnecting_to_the_same_mcu_health_checks_its_websocket_client() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let state = AppState::default();
         let controller = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            for _ in 0..2 {
+                let request = receive_json_rpc_request(&mut websocket).await;
+                assert_eq!(request["method"], "system.ping");
+                websocket
+                    .send(ControllerMessage::Text(
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "result": { "ready": true }
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        assert!(matches!(
+            connect(&state, "127.0.0.1".to_owned(), port).await,
+            ServerMessage::Connected { .. }
+        ));
+        assert!(matches!(
+            connect(&state, "127.0.0.1".to_owned(), port).await,
+            ServerMessage::Connected { .. }
+        ));
+        controller.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnecting_replaces_a_stale_controller_websocket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = AppState::default();
+        let controller = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            let request = receive_json_rpc_request(&mut websocket).await;
+            assert_eq!(request["method"], "system.ping");
+            websocket
+                .send(ControllerMessage::Text(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": { "ready": true }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            drop(websocket);
+
             let (stream, _) = listener.accept().await.unwrap();
             let mut websocket = accept_async(stream).await.unwrap();
             let request = receive_json_rpc_request(&mut websocket).await;
@@ -1838,12 +1910,11 @@ mod tests {
             connect(&state, "127.0.0.1".to_owned(), port).await,
             ServerMessage::Connected { .. }
         ));
-        controller.await.unwrap();
-
         assert!(matches!(
             connect(&state, "127.0.0.1".to_owned(), port).await,
             ServerMessage::Connected { .. }
         ));
+        controller.await.unwrap();
     }
 
     #[tokio::test]
