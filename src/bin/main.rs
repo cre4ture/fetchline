@@ -8,6 +8,8 @@
 #![deny(clippy::large_stack_frames)]
 
 use embassy_executor::Spawner;
+#[path = "../controller.rs"]
+mod controller_protocol;
 #[path = "../websocket.rs"]
 mod websocket;
 
@@ -66,7 +68,6 @@ const COPY_BUFFER_SIZE: usize = 512;
 const JSON_RPC_BUFFER_SIZE: usize = 1024;
 const MAX_POSITION_BATCH: usize = 6;
 const STS_RESPONSE_TIMEOUT: Duration = Duration::from_millis(50);
-const STS_HEADER: [u8; 2] = [0xff, 0xff];
 const STS_BROADCAST_ID: u8 = 0xfe;
 // STS reserves 254 for broadcast; valid unicast servo IDs end at 253.
 const MAX_SERVO_ID: u8 = STS_BROADCAST_ID - 1;
@@ -190,22 +191,23 @@ static RAW_TUNNEL: RawTunnelControl = RawTunnelControl::new();
 /// the previous generation is notified and closes its session before accepting
 /// another controller command.
 struct ControllerOwnership {
-    current: BlockingMutex<CriticalSectionRawMutex, Cell<u64>>,
+    current: BlockingMutex<CriticalSectionRawMutex, Cell<controller_protocol::ControllerEpoch>>,
     changes: Watch<CriticalSectionRawMutex, u64, CONTROLLER_SOCKET_SLOTS>,
 }
 
 impl ControllerOwnership {
     const fn new() -> Self {
         Self {
-            current: BlockingMutex::new(Cell::new(0)),
+            current: BlockingMutex::new(Cell::new(controller_protocol::ControllerEpoch::new())),
             changes: Watch::new(),
         }
     }
 
     fn claim(&self) -> u64 {
         let generation = self.current.lock(|current| {
-            let generation = current.get().wrapping_add(1);
-            current.set(generation);
+            let mut epoch = current.get();
+            let generation = epoch.claim();
+            current.set(epoch);
             generation
         });
         self.changes.sender().send(generation);
@@ -213,7 +215,8 @@ impl ControllerOwnership {
     }
 
     fn is_current(&self, generation: u64) -> bool {
-        self.current.lock(|current| current.get() == generation)
+        self.current
+            .lock(|current| current.get().is_current(generation))
     }
 }
 
@@ -1063,22 +1066,14 @@ mod services {
         instruction: u8,
         parameters: &[u8],
     ) -> Result<StsStatus, ServoFailure> {
-        let length = parameters
-            .len()
-            .checked_add(2)
-            .ok_or(ServoFailure::InvalidArgument)?;
-        let length = u8::try_from(length).map_err(|_| ServoFailure::InvalidArgument)?;
         let mut packet = [0_u8; 16];
-        let packet_len = parameters.len() + 6;
-        if packet_len > packet.len() {
-            return Err(ServoFailure::InvalidArgument);
-        }
-        packet[..2].copy_from_slice(&STS_HEADER);
-        packet[2] = id;
-        packet[3] = length;
-        packet[4] = instruction;
-        packet[5..5 + parameters.len()].copy_from_slice(parameters);
-        packet[packet_len - 1] = checksum(&packet[2..packet_len - 1]);
+        let packet_len = controller_protocol::encode_instruction_packet(
+            &mut packet,
+            id,
+            instruction,
+            parameters,
+        )
+        .map_err(|_| ServoFailure::InvalidArgument)?;
         uart_tx
             .write_all(&packet[..packet_len])
             .await
@@ -1111,32 +1106,26 @@ mod services {
         if !found_header {
             return Err(ServoFailure::InvalidReply);
         }
-        let id = read_uart_byte(uart_rx).await?;
+        let mut packet = [0_u8; 68];
+        packet[0] = read_uart_byte(uart_rx).await?;
         let length = read_uart_byte(uart_rx).await? as usize;
-        if id != expected_id || !(2..=66).contains(&length) {
+        if !(2..=66).contains(&length) {
             return Err(ServoFailure::InvalidReply);
         }
-        let error = read_uart_byte(uart_rx).await?;
-        let payload_len = length - 2;
-        let mut payload = [0_u8; 64];
-        for byte in &mut payload[..payload_len] {
+        packet[1] = length as u8;
+        for byte in &mut packet[2..length + 2] {
             *byte = read_uart_byte(uart_rx).await?;
         }
-        let received_checksum = read_uart_byte(uart_rx).await?;
-        let mut checksum_bytes = [0_u8; 66];
-        checksum_bytes[0] = error;
-        checksum_bytes[1..1 + payload_len].copy_from_slice(&payload[..payload_len]);
-        if received_checksum
-            != status_checksum(id, length as u8, &checksum_bytes[..1 + payload_len])
-        {
-            return Err(ServoFailure::InvalidReply);
-        }
-        if error != 0 {
+        let status = controller_protocol::decode_status_packet(&packet[..length + 2], expected_id)
+            .map_err(|_| ServoFailure::InvalidReply)?;
+        if status.error != 0 {
             return Err(ServoFailure::ReportedError);
         }
+        let mut payload = [0_u8; 64];
+        payload[..status.parameters.len()].copy_from_slice(status.parameters);
         Ok(StsStatus {
             payload,
-            payload_len,
+            payload_len: status.parameters.len(),
         })
     }
 
@@ -1174,26 +1163,6 @@ mod services {
 
     const fn is_unicast_servo_id(id: u8) -> bool {
         id != 0 && id <= MAX_SERVO_ID
-    }
-
-    const fn checksum(bytes: &[u8]) -> u8 {
-        let mut sum = 0_u8;
-        let mut index = 0;
-        while index < bytes.len() {
-            sum = sum.wrapping_add(bytes[index]);
-            index += 1;
-        }
-        !sum
-    }
-
-    const fn status_checksum(id: u8, length: u8, bytes: &[u8]) -> u8 {
-        let mut sum = id.wrapping_add(length);
-        let mut index = 0;
-        while index < bytes.len() {
-            sum = sum.wrapping_add(bytes[index]);
-            index += 1;
-        }
-        !sum
     }
 
     const fn decode_signed_15(value: u16) -> i16 {

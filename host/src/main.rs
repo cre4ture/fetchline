@@ -1407,6 +1407,7 @@ mod tests {
         http::{Request, StatusCode},
     };
     use tempfile::tempdir;
+    use tokio::sync::oneshot;
     use tokio_tungstenite::accept_async;
     use tower::ServiceExt;
 
@@ -1551,6 +1552,90 @@ mod tests {
 
         let response = app(state).oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn browser_host_and_controller_complete_a_servo_scan_end_to_end() {
+        let mcu_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mcu_address = mcu_listener.local_addr().unwrap();
+        let mcu = tokio::spawn(async move {
+            let (stream, _) = mcu_listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+
+            let request = receive_json_rpc_request(&mut websocket).await;
+            assert_eq!(request["method"], "system.ping");
+            websocket
+                .send(ControllerMessage::Text(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": { "ready": true }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            let request = receive_json_rpc_request(&mut websocket).await;
+            assert_eq!(request["method"], "servo.scan");
+            assert_eq!(request["params"]["startId"], 1);
+            assert_eq!(request["params"]["endId"], 10);
+            websocket
+                .send(ControllerMessage::Text(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": { "ids": [5] }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let (host_address, shutdown, host) = spawn_test_host(AppState::default()).await;
+        let stream = TcpStream::connect(host_address).await.unwrap();
+        let endpoint = format!("ws://{host_address}/ws");
+        let (mut browser, _) = client_async(endpoint, stream).await.unwrap();
+
+        browser
+            .send(ControllerMessage::Text(
+                serde_json::json!({
+                    "type": "connect",
+                    "host": "127.0.0.1",
+                    "port": mcu_address.port()
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(receive_browser_response(&mut browser).await["type"], "connected");
+
+        browser
+            .send(ControllerMessage::Text(
+                serde_json::json!({
+                    "type": "scan_servos",
+                    "start_id": 1,
+                    "end_id": 10
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let response = receive_browser_response(&mut browser).await;
+        assert_eq!(response["type"], "servo_scan");
+        assert_eq!(response["start_id"], 1);
+        assert_eq!(response["end_id"], 10);
+        assert_eq!(response["ids"], serde_json::json!([5]));
+
+        drop(browser);
+        shutdown.send(()).unwrap();
+        host.await.unwrap();
+        mcu.await.unwrap();
     }
 
     #[tokio::test]
@@ -1944,6 +2029,26 @@ mod tests {
         }
     }
 
+    async fn spawn_test_host(
+        state: AppState,
+    ) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown, shutdown_requested) = oneshot::channel();
+        let host = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app(state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_requested.await;
+            })
+            .await
+            .unwrap();
+        });
+        (address, shutdown, host)
+    }
+
     async fn bridge_for(address: SocketAddr) -> BridgeConnection {
         raw_bridge(address).await
     }
@@ -1981,6 +2086,14 @@ mod tests {
         let message = websocket.next().await.unwrap().unwrap();
         let ControllerMessage::Text(text) = message else {
             panic!("JSON-RPC request must be a WebSocket text message");
+        };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    async fn receive_browser_response(websocket: &mut WebSocketStream<TcpStream>) -> Value {
+        let message = websocket.next().await.unwrap().unwrap();
+        let ControllerMessage::Text(text) = message else {
+            panic!("browser response must be a WebSocket text message");
         };
         serde_json::from_str(&text).unwrap()
     }

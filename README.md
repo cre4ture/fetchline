@@ -90,6 +90,23 @@ previous session. The host has no authentication: every device that can reach
 the MCU can therefore take over physical actuators. Keep it on a trusted LAN,
 or firewall the port / use a VPN.
 
+## Testing
+
+`just check` runs the firmware release build and lint, eight native tests for
+the production STS packet parser/encoder and controller-ownership epoch, and
+the host test suite. The host suite includes an end-to-end WebSocket test that
+drives a browser request through the host into a simulated MCU controller API.
+
+The physical ESP32-C3/Wi-Fi/FE-URT-2/servo path cannot run in CI. With current
+firmware on an MCU, the reproducible hardware smoke test below opens two real
+controller WebSockets, verifies that the second responds, and verifies that it
+closed the first one. It intentionally takes over the active controller
+session, so do not run it during motion:
+
+```sh
+python3 scripts/test-controller-takeover.py --host <mcu-ip>
+```
+
 ### Controller API
 
 Port `3333` exposes [JSON-RPC 2.0](https://www.jsonrpc.org/specification) in

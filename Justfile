@@ -35,10 +35,11 @@ host-logs:
 provision-wifi port="/dev/ttyACM0":
     cargo run --manifest-path host/Cargo.toml --target "{{host_target}}" --bin provision-wifi -- "{{port}}"
 
-# Run formatting, firmware, lint, and native-host checks.
+# Run formatting, firmware, lint, native firmware-logic, and host checks.
 check:
     cargo fmt --all --check
     cargo build --release
     cargo clippy --workspace --all-features -- -D warnings
+    cargo test --manifest-path firmware-tests/Cargo.toml --target "{{host_target}}"
     cargo check --manifest-path host/Cargo.toml --target "{{host_target}}"
     cargo test --manifest-path host/Cargo.toml --target "{{host_target}}"
