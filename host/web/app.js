@@ -270,8 +270,8 @@ function finishServoScan() {
 function scanServos() {
   const startInput = document.querySelector("#servo-scan-start");
   const endInput = document.querySelector("#servo-scan-end");
-  const startId = clampNumber(startInput.value, 1, 255, 1);
-  const endId = clampNumber(endInput.value, 1, 255, 10);
+  const startId = clampNumber(startInput.value, 1, 253, 1);
+  const endId = clampNumber(endInput.value, 1, 253, 10);
   startInput.value = startId;
   endInput.value = endId;
   if (startId > endId) {

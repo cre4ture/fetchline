@@ -33,9 +33,9 @@ It controls Feetech **STS/SMS-compatible** servos with the normal STS protocol:
   connects and when **Update positions** is pressed. A missing or faulty servo
   is reported individually and does not disconnect the remaining servo controls.
 - **Find connected servos** searches a selectable address range directly on the
-  MCU. It defaults to IDs 1–10 and accepts 1–255; the MCU probes the bus with
-  its local STS deadline and returns every responding ID. Addresses 254 and 255
-  are skipped because they are reserved by STS.
+  MCU. It defaults to IDs 1–10 and accepts 1–253; the MCU probes the bus with
+  its local STS deadline and returns every responding ID. STS address 254 is
+  broadcast and 255 is invalid, so neither can be selected.
 - The MCU address, IDs, enabled state, and all control limits are stored by
   the Linux host in `~/.config/fetchline-host/config.json` (or
   `$XDG_CONFIG_HOME/fetchline-host/config.json`). Every browser opening the

@@ -38,12 +38,13 @@ use tokio_tungstenite::{WebSocketStream, client_async, tungstenite::Message as C
 
 const DEFAULT_LISTEN_ADDRESS: &str = "0.0.0.0:8787";
 const SERVO_TIMEOUT: Duration = Duration::from_millis(750);
-// Each unused STS address gets a 50 ms deadline on the MCU. A 1–255 scan also
+// Each unused STS address gets a 50 ms deadline on the MCU. A 1–253 scan also
 // includes UART recovery time, so it needs a longer controller response wait.
 const SERVO_SCAN_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_STALE_CONTROLLER_RESPONSES: usize = 32;
 const STS_HEADER: [u8; 2] = [0xff, 0xff];
 const STS_BROADCAST_ID: u8 = 0xfe;
+const MAX_SERVO_ID: u8 = STS_BROADCAST_ID - 1;
 const STS_INSTRUCTION_READ: u8 = 0x02;
 const STS_INSTRUCTION_WRITE: u8 = 0x03;
 const STS_MODE: u8 = 33;
@@ -1032,9 +1033,7 @@ async fn scan_servos(
     start_id: u8,
     end_id: u8,
 ) -> Result<ServerMessage, String> {
-    if start_id == 0 || start_id > end_id {
-        return Err("Servo search IDs must be between 1 and 255, with a start no greater than the end".to_owned());
-    }
+    validate_scan_range(start_id, end_id)?;
     if !connection.is_controller() {
         return Err("Servo search is available only in JSON-RPC controller mode, not through the raw debug tunnel".to_owned());
     }
@@ -1081,7 +1080,15 @@ fn validate_id(id: u8) -> Result<(), String> {
 }
 
 fn is_unicast_servo_id(id: u8) -> bool {
-    id != 0 && id != STS_BROADCAST_ID && id != u8::MAX
+    id != 0 && id <= MAX_SERVO_ID
+}
+
+fn validate_scan_range(start_id: u8, end_id: u8) -> Result<(), String> {
+    if start_id == 0 || start_id > end_id || end_id > MAX_SERVO_ID {
+        Err("Servo search IDs must be between 1 and 253, with a start no greater than the end".to_owned())
+    } else {
+        Ok(())
+    }
 }
 
 impl BridgeConnection {
@@ -1394,6 +1401,14 @@ mod tests {
         assert!(validate_id(0).is_err());
         assert!(validate_id(254).is_err());
         assert!(validate_id(255).is_err());
+    }
+
+    #[test]
+    fn limits_servo_scans_to_unicast_addresses() {
+        assert!(validate_scan_range(1, 253).is_ok());
+        assert!(validate_scan_range(0, 10).is_err());
+        assert!(validate_scan_range(1, 254).is_err());
+        assert!(validate_scan_range(10, 1).is_err());
     }
 
     #[test]

@@ -60,12 +60,12 @@ const TCP_BUFFER_SIZE: usize = 4096;
 const COPY_BUFFER_SIZE: usize = 512;
 const JSON_RPC_BUFFER_SIZE: usize = 1024;
 const MAX_POSITION_BATCH: usize = 6;
-// STS reserves 254 for broadcast and does not permit 255 as a servo address.
-// A full scan can therefore return at most IDs 1 through 253.
-const MAX_SCAN_RESULTS: usize = 253;
 const STS_RESPONSE_TIMEOUT: Duration = Duration::from_millis(50);
 const STS_HEADER: [u8; 2] = [0xff, 0xff];
 const STS_BROADCAST_ID: u8 = 0xfe;
+// STS reserves 254 for broadcast; valid unicast servo IDs end at 253.
+const MAX_SERVO_ID: u8 = STS_BROADCAST_ID - 1;
+const MAX_SCAN_RESULTS: usize = MAX_SERVO_ID as usize;
 const STS_INSTRUCTION_PING: u8 = 0x01;
 const STS_INSTRUCTION_READ: u8 = 0x02;
 const STS_INSTRUCTION_WRITE: u8 = 0x03;
@@ -755,15 +755,15 @@ mod services {
         start_id: u8,
         end_id: u8,
     ) -> Result<serde_json_core::heapless::Vec<u8, MAX_SCAN_RESULTS>, ServoFailure> {
-        if start_id == 0 || start_id > end_id {
+        if start_id == 0 || start_id > end_id || end_id > MAX_SERVO_ID {
             return Err(ServoFailure::InvalidArgument);
         }
 
         let mut ids = serde_json_core::heapless::Vec::new();
         for raw_id in u16::from(start_id)..=u16::from(end_id) {
             let id = raw_id as u8;
-            // Do not transmit an STS read/ping to the broadcast or invalid
-            // addresses, even when a user-selected range includes them.
+            // This remains a defence in depth in case scan range validation is
+            // changed later: never transmit to broadcast or invalid addresses.
             if !is_unicast_servo_id(id) {
                 continue;
             }
@@ -1076,7 +1076,7 @@ mod services {
     }
 
     const fn is_unicast_servo_id(id: u8) -> bool {
-        id != 0 && id != STS_BROADCAST_ID && id != u8::MAX
+        id != 0 && id <= MAX_SERVO_ID
     }
 
     const fn checksum(bytes: &[u8]) -> u8 {
