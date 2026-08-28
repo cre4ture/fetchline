@@ -1063,12 +1063,24 @@ async fn scan_servos(
 /// can be discarded safely. Raw debug tunnelling retains the legacy behavior.
 /// Broken TCP I/O is the only case that requires reconnecting.
 fn connection_is_usable_after(error: &str) -> bool {
-    !error.starts_with("Timed out sending command to the MCU")
-        && !error.starts_with("Could not send command to the MCU")
-        && !error.starts_with("Could not read STS servo reply")
-        && !error.starts_with("Could not send a controller command to the MCU")
-        && !error.starts_with("Could not read an MCU controller response")
-        && !error.starts_with("MCU sent an invalid controller frame")
+    const BROKEN_CONNECTION_PREFIXES: [&str; 13] = [
+        "Timed out sending command to the MCU",
+        "Could not send command to the MCU",
+        "Could not read STS servo reply",
+        "Timed out sending a JSON-RPC command to the MCU",
+        "Could not send a JSON-RPC command to the MCU",
+        "Timed out waiting for an MCU JSON-RPC response",
+        "MCU closed the JSON-RPC WebSocket",
+        "Could not read an MCU JSON-RPC response",
+        "MCU sent invalid JSON-RPC",
+        "MCU sent a JSON-RPC response with an unsupported version",
+        "Could not answer MCU WebSocket ping",
+        "MCU sent an unsupported WebSocket message",
+        "MCU sent too many stale JSON-RPC responses",
+    ];
+    !BROKEN_CONNECTION_PREFIXES
+        .iter()
+        .any(|prefix| error.starts_with(prefix))
 }
 
 fn validate_id(id: u8) -> Result<(), String> {
@@ -1421,6 +1433,12 @@ mod tests {
         ));
         assert!(!connection_is_usable_after(
             "Could not send command to the MCU: Connection reset by peer"
+        ));
+        assert!(!connection_is_usable_after(
+            "Could not send a JSON-RPC command to the MCU: IO error: Broken pipe (os error 32)"
+        ));
+        assert!(!connection_is_usable_after(
+            "Timed out waiting for an MCU JSON-RPC response"
         ));
     }
 
