@@ -118,6 +118,27 @@ just host-debug-tunnel
 Do not use the debug tunnel for normal actuation: it intentionally restores the
 old raw request/reply timing characteristics.
 
+### USB UART bridge diagnostic
+
+For hardware diagnostics, `scripts/bridge-sts-uarts.py` temporarily links an
+adapter wired to the MCU UART with a second adapter connected to the FE-URT2.
+It forwards both directions at 1,000,000 baud and logs the exact STS bytes.
+Start it, then use the normal control panel to run a small servo scan:
+
+```sh
+python3 scripts/bridge-sts-uarts.py \
+  --mcu-device /dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_0001-if00-port0 \
+  --feurt-device /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG03AS5Q-if00-port0 \
+  --duration-seconds 30
+```
+
+The bridge is for controlled diagnostics only: it forwards every STS command,
+including commands that can move a servo. Stop it when the test completes; use
+`--duration-seconds 0` only when an intentionally open-ended bridge is needed.
+It replaces the direct MCU-to-FE-URT2 UART path for the duration of the test;
+do not leave that physical UART path connected in parallel with both USB UART
+adapters.
+
 It uses DHCP, reconnects Wi-Fi automatically, accepts one TCP client at a time,
 and keeps UART1 fixed at 1,000,000 baud, 8 data bits, no parity, and 1 stop bit.
 After DHCP completes, the OLED shows the assigned IPv4 address across two lines
