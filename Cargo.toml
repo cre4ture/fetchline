@@ -10,6 +10,7 @@ name = "fetchline"
 path = "./src/bin/main.rs"
 
 [dependencies]
+base64ct = "1.8.3"
 embassy-executor = { version = "0.10.0", features = ["log"] }
 embassy-futures = "0.1.2"
 embassy-net = { version = "0.9.1", features = [
@@ -18,6 +19,7 @@ embassy-net = { version = "0.9.1", features = [
   "medium-ethernet",
   "tcp",
 ] }
+embassy-sync = "0.8.0"
 embassy-time = { version = "0.5.0", features = ["log"] }
 embedded-graphics = "0.8.2"
 embedded-io-async = "0.7.0"
@@ -51,6 +53,10 @@ esp-rtos = { version = "0.3.0", features = [
   "log-04",
 ] }
 log = "0.4.27"
+fetchline-protocol = { path = "protocol" }
+serde = { version = "1.0.229", default-features = false, features = ["derive"] }
+serde-json-core = { version = "0.6.0", default-features = false, features = ["heapless"] }
+sha1 = { version = "0.11.0", default-features = false }
 ssd1306 = "0.10.0"
 static_cell = "2.1.1"
 

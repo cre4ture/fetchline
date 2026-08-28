@@ -1,0 +1,10 @@
+[package]
+name = "fetchline-protocol"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Versioned controller protocol shared by fetchline host and firmware"
+
+[lib]
+path = "src/lib.rs"

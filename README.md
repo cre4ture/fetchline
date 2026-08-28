@@ -1,22 +1,25 @@
 # fetchline
 
 Bare-metal Rust firmware for the EGBO mini ESP32-C3 board with its built-in
-0.42-inch OLED. It connects a Feetech FE-URT-2 adapter to Wi-Fi, allowing
-Windows servo software to use a virtual COM port as though the STS servo bus
-were connected locally.
+0.42-inch OLED. It connects a Feetech FE-URT-2 adapter to Wi-Fi and exposes a
+versioned, high-level controller API for STS/SMS servos.
 
-The bridge is transparent and binary-safe:
+The normal control path terminates the time-sensitive STS protocol on the MCU:
 
 ```text
-Windows COM port <-> raw TCP port 3333 <-> ESP32-C3 UART1 <-> FE-URT-2 <-> STS servos
+Browser <-> Linux host <-> controller API / Wi-Fi <-> ESP32-C3 <-> UART1 <-> FE-URT-2 <-> STS servos
 ```
+
+The MCU owns the UART transaction, local response deadline, and recovery from
+late STS replies. Wi-Fi carries only controller requests and JSON-RPC results,
+so a delayed network packet cannot be mistaken for a later servo response.
 
 ## Linux host control panel
 
 The `host/` directory contains a Linux PC application with a browser UI for
-direct manual control. It owns the one raw-TCP connection to the MCU and serves
-the UI on the local machine, so no browser extension and no virtual COM driver
-is required.
+direct manual control. It normally owns the persistent controller-API
+connection to the MCU and serves the UI on the local machine, so no browser
+extension and no virtual COM driver is required.
 
 It controls Feetech **STS/SMS-compatible** servos with the normal STS protocol:
 
@@ -29,6 +32,10 @@ It controls Feetech **STS/SMS-compatible** servos with the normal STS protocol:
   servos are never read or commanded. Current positions are read when the MCU
   connects and when **Update positions** is pressed. A missing or faulty servo
   is reported individually and does not disconnect the remaining servo controls.
+- **Find connected servos** searches a selectable address range directly on the
+  MCU. It defaults to IDs 1–10 and accepts 1–253; the MCU probes the bus with
+  its local STS deadline and returns every responding ID. STS address 254 is
+  broadcast and 255 is invalid, so neither can be selected.
 - The MCU address, IDs, enabled state, and all control limits are stored by
   the Linux host in `~/.config/fetchline-host/config.json` (or
   `$XDG_CONFIG_HOME/fetchline-host/config.json`). Every browser opening the
@@ -62,27 +69,106 @@ just host-logs
 ```
 
 The normal log records host startup, browser WebSocket connect/disconnect,
-MCU TCP connection attempts and failures, and every servo action with its
-elapsed time. Individual servo timeouts, corrupt replies, and servo-reported
-STS errors are logged with the servo ID while retaining the MCU TCP connection
-when possible. For individual STS packet metadata, start the panel with:
+MCU controller-API connection attempts and failures, and every servo action
+with its elapsed time. The MCU reports local STS timeouts, invalid replies, and
+servo errors as structured JSON-RPC errors. Delayed API responses carry a
+JSON-RPC request ID and are discarded by the host rather than being associated
+with a later action. For controller diagnostics, start the panel with:
 
 ```sh
 just host-debug
 ```
 
 Packet payloads are intentionally not logged. This avoids filling the log
-during live slider movement while retaining the IDs, instructions, errors, and
-timing needed to distinguish a host/MCU network failure from a servo-bus
-failure.
+during live slider movement while retaining the IDs, actions, errors, and timing
+needed to distinguish a host/MCU network failure from a servo-bus failure.
 
-Only one program may use the MCU TCP bridge. Close the virtual COM software and
-any other `fetchline-host` page before connecting this panel. The host has no
-authentication: every device that can reach its port can command physical
-actuators. Keep it on a trusted LAN, or firewall the port / use a VPN.
+The MCU reserves three TCP transport sockets so that one continues listening
+while a new connection replaces the current session. Only the newest
+successfully upgraded WebSocket session may execute controller commands; it
+closes every previous session. The extra sockets are transport capacity, not
+additional controller authority: exactly one session owns the STS bus. The host
+has no authentication: every device that can reach the MCU can therefore take
+over physical actuators. Keep it on a trusted LAN, or firewall the port / use a
+VPN.
 
-It uses DHCP, reconnects Wi-Fi automatically, accepts one TCP client at a time,
-and keeps UART1 fixed at 1,000,000 baud, 8 data bits, no parity, and 1 stop bit.
+Takeovers are serialized until a retiring socket has returned to listening
+mode. This prevents a burst of reconnects from leaving every transport socket
+busy flushing a prior TCP reset. The host retries the brief transport transition
+automatically before reporting a connection failure.
+
+## Testing
+
+`just check` runs the firmware release build and lint, ten native tests for
+the production STS packet parser/encoder and controller-ownership epoch, and
+the host test suite. The host suite includes an end-to-end WebSocket test that
+drives a browser request through the host into a simulated MCU controller API.
+
+The physical ESP32-C3/Wi-Fi/FE-URT-2/servo path cannot run in CI. With current
+firmware on an MCU, the reproducible hardware smoke test below opens two real
+controller WebSockets, verifies that the second responds, and verifies that it
+closed the first one. It intentionally takes over the active controller
+session, so do not run it during motion:
+
+```sh
+python3 scripts/test-controller-takeover.py --host <mcu-ip>
+```
+
+### Controller API
+
+Port `3333` exposes [JSON-RPC 2.0](https://www.jsonrpc.org/specification) in
+WebSocket text frames at `ws://<mcu-ip>:3333/rpc`. Requests use numeric
+JSON-RPC IDs; the reply carries the same ID. The API methods are
+`system.ping`, `motor.start`, `motor.stop`, `servo.setPosition`,
+`servo.getPosition`, `servo.getPositions`, `servo.scan`, `debug.enableRawTunnel`, and
+`debug.disableRawTunnel`. The complete method and parameter reference is in
+[`protocol/README.md`](protocol/README.md).
+
+For example, a position command is:
+
+```json
+{"jsonrpc":"2.0","id":42,"method":"servo.setPosition","params":{"id":5,"position":1625,"acceleration":20,"torqueLimit":1000}}
+```
+
+The raw UART tunnel exists only for special tests. Calling
+`debug.enableRawTunnel` opens the separate TCP port `3334`; it does **not**
+change or close the controller WebSocket. The RAW port stays open across any
+number of raw-client disconnects and reconnects. Only
+`debug.disableRawTunnel` closes it, including an active raw client. While it
+is enabled, normal motor and servo methods fail with JSON-RPC error `-32010`.
+The included host can enable it and connect its raw test path with:
+
+```sh
+just host-debug-tunnel
+```
+
+Do not use the debug tunnel for normal actuation: it intentionally restores the
+old raw request/reply timing characteristics.
+
+### USB UART bridge diagnostic
+
+For hardware diagnostics, `scripts/bridge-sts-uarts.py` temporarily links an
+adapter wired to the MCU UART with a second adapter connected to the FE-URT2.
+It forwards both directions at 1,000,000 baud and logs the exact STS bytes.
+Start it, then use the normal control panel to run a small servo scan:
+
+```sh
+python3 scripts/bridge-sts-uarts.py \
+  --mcu-device /dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_0001-if00-port0 \
+  --feurt-device /dev/serial/by-id/usb-FTDI_FT232R_USB_UART_BG03AS5Q-if00-port0 \
+  --duration-seconds 30
+```
+
+The bridge is for controlled diagnostics only: it forwards every STS command,
+including commands that can move a servo. Stop it when the test completes; use
+`--duration-seconds 0` only when an intentionally open-ended bridge is needed.
+It replaces the direct MCU-to-FE-URT2 UART path for the duration of the test;
+do not leave that physical UART path connected in parallel with both USB UART
+adapters.
+
+It uses DHCP, reconnects Wi-Fi automatically, keeps up to two controller TCP
+sessions while the newest one owns the STS bus, and keeps UART1 fixed at
+1,000,000 baud, 8 data bits, no parity, and 1 stop bit.
 After DHCP completes, the OLED shows the assigned IPv4 address across two lines
 and keeps it visible while clients connect and disconnect. Startup or
 configuration diagnostics are shown only until an address is available. The
@@ -99,7 +185,7 @@ assigned address is also printed to the USB serial monitor.
 | Servo UART | UART1, 1,000,000 baud, 8N1 |
 | Servo UART RX | GPIO20, board pin `RX` |
 | Servo UART TX | GPIO21, board pin `TX` |
-| Network endpoint | raw TCP server, port 3333 |
+| Network endpoint | JSON-RPC 2.0 WebSocket server at `ws://<IP>:3333/rpc` |
 
 The OLED address is presumed from this board family because it was not listed
 by the seller. If the screen stays blank, scan the I2C bus and try `0x3d` in
@@ -138,6 +224,20 @@ direction switching. See Feetech's official
 Feetech lists the FE-URT-2 as a Type-C USB-to-TTL/RS485 programmer with a UART
 header. Its supported range reaches 1 Mbps; see the
 [official Feetech debugging-board listing](https://www.feetechrc.com/serial-port-series-steering-gear_50681).
+
+### Direct FE-URT-2 USB scan
+
+With the FE-URT-2 connected directly by USB (and the ESP32 UART wires
+disconnected), scan the bus without moving or reconfiguring any servo:
+
+```sh
+python3 scripts/scan-sts-servos.py \
+  --device /dev/serial/by-id/usb-1a86_USB_Single_Serial_<serial>-if00
+```
+
+The scanner uses per-ID STS PING packets at 1,000,000 baud, 8N1. It requires
+an explicit device path, accepts a 1–253 range through `--start-id` and
+`--end-id`, and never sends a broadcast packet or a register write.
 
 ## Prerequisites
 
@@ -179,46 +279,29 @@ not a 5 GHz-only network. If automatic download mode fails, hold **BOOT**, tap
 After DHCP completes, the USB log contains a line similar to:
 
 ```text
-Wi-Fi ready: IP 192.168.1.123/24, raw TCP port 3333
+Wi-Fi ready: IP 192.168.1.123/24, JSON-RPC WebSocket port 3333
 ```
 
-Reserve that address for the board in the router's DHCP settings so the Windows
-virtual-COM configuration remains stable.
+Reserve that address for the board in the router's DHCP settings so controller
+clients can reconnect to a stable endpoint.
 
-## Windows virtual COM port
+## Raw UART debug tunnel
 
-[HW VSP3 Single](https://www.hw-group.com/software/hw-vsp3-virtual-serial-port)
-is one Windows virtual serial port driver that can redirect a COM port to an
-IP address and TCP port. Install it as an administrator, then:
-
-1. Check connectivity in PowerShell:
-
-   ```powershell
-   Test-NetConnection 192.168.1.123 -Port 3333
-   ```
-
-2. Open **Virtual Serial Port** in HW VSP3 and choose an unused port such as
-   `COM9`.
-3. Enter the ESP32-C3's DHCP address and port `3333`.
-4. Use normal client mode, turn off **TCP server mode**, and click **Create COM**.
-5. Leave **NVT**, **NVT filter**, and **NVT port setup** disabled. Fetchline uses
-   transparent raw TCP, not Telnet or RFC 2217 control sequences.
-6. In the Feetech application, open that COM port at **1,000,000 baud, 8N1**.
-
-The firmware's UART parameters are fixed; changing the baud rate in Windows
-does not reconfigure the remote UART. A detailed example of creating a COM port
-from an IP address and port is available in the
-[Teltonika HW VSP3 guide](https://wiki.teltonika-networks.com/view/Connect_Serial_Devices_as_Virtual_COM_Ports_using_TRB145_and_HW_VSP3).
-
-Only one Windows application can open a COM port, and fetchline accepts only one
-TCP client. Close Feetech tools, terminals, or previous VSP connections that may
-already own it before troubleshooting a connection.
+The old transparent UART bridge is no longer the default service. It is a
+debug-only listener enabled by the JSON-RPC method `debug.enableRawTunnel`.
+When enabled, port `3334` accepts one raw TCP client at a time. A client can
+disconnect and reconnect later without disabling the listener. Use
+`debug.disableRawTunnel` to close it explicitly. Generic virtual-COM tools
+cannot use it by merely opening port `3333`; they must use `3334` after the
+debug command has enabled that port. `just host-debug-tunnel` provides a
+controlled browser-based raw test path.
 
 ## Security
 
-Port 3333 has no authentication or encryption. Every byte received is sent to
-physical actuators. Use this firmware only on a trusted private LAN or through a
-VPN. Never expose or port-forward TCP 3333 to the public internet.
+Port `3333` has no authentication or encryption. Controller commands can move
+physical actuators, and its debug command can open unrestricted raw UART port
+`3334`. Use this firmware only on a trusted private LAN or through a VPN. Never
+expose or port-forward either port to the public internet.
 
 ## Development checks
 

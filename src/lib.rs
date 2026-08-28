@@ -20,6 +20,4 @@ pub mod board {
     pub const SERVO_UART_TX_GPIO: u8 = 21;
     /// Fixed Feetech STS bus baud rate.
     pub const SERVO_UART_BAUD: u32 = 1_000_000;
-    /// Raw TCP port exposed to virtual-COM software.
-    pub const BRIDGE_TCP_PORT: u16 = 3333;
 }

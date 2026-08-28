@@ -16,8 +16,10 @@ const defaults = {
 let config = structuredClone(defaults);
 let socket;
 let connectedToMcu = false;
+let servoScanInProgress = false;
 const currentPositions = new Map();
 const queuedMoves = new Map();
+const lastSentPositions = new Map();
 
 async function loadConfig() {
   try {
@@ -223,14 +225,17 @@ function queuePositionMove(index, position, flush = false) {
   document.querySelector(`#position-value-${index}`).value = position;
   const pending = queuedMoves.get(index);
   if (pending) clearTimeout(pending);
+  if (flush && !pending && lastSentPositions.get(index) === position) return;
   const sendMove = () => {
     queuedMoves.delete(index);
     const joint = config.joints[index];
     if (!joint.enabled) return;
+    const target = currentPositions.get(index);
+    lastSentPositions.set(index, target);
     send({
       type: "move_position",
       id: joint.id,
-      position: currentPositions.get(index),
+      position: target,
       acceleration: joint.acceleration,
       torque_limit: torqueLimit(joint.torquePercent),
     });
@@ -250,16 +255,48 @@ function refreshPositions() {
   if (ids.length > 0) send({ type: "read_positions", ids });
 }
 
+function setServoScanResult(text, kind = "") {
+  const result = document.querySelector("#servo-scan-result");
+  result.textContent = text;
+  result.className = `scan-result ${kind}`;
+}
+
+function finishServoScan() {
+  servoScanInProgress = false;
+  const button = document.querySelector("#servo-scan-button");
+  if (button) button.disabled = false;
+}
+
+function scanServos() {
+  const startInput = document.querySelector("#servo-scan-start");
+  const endInput = document.querySelector("#servo-scan-end");
+  const startId = clampNumber(startInput.value, 1, 253, 1);
+  const endId = clampNumber(endInput.value, 1, 253, 10);
+  startInput.value = startId;
+  endInput.value = endId;
+  if (startId > endId) {
+    setServoScanResult("Start ID must not exceed end ID.", "error");
+    return;
+  }
+  if (servoScanInProgress) return;
+
+  servoScanInProgress = true;
+  document.querySelector("#servo-scan-button").disabled = true;
+  setServoScanResult(`Searching IDs ${startId}–${endId} on the MCU…`);
+  if (!send({ type: "scan_servos", start_id: startId, end_id: endId })) finishServoScan();
+}
+
 function send(message, allowedBeforeMcuConnect = false) {
   if (!socket || socket.readyState !== WebSocket.OPEN) {
     setStatus("Local host is not connected", "error");
-    return;
+    return false;
   }
   if (!allowedBeforeMcuConnect && !connectedToMcu) {
     setStatus("Connect to the MCU first", "error");
-    return;
+    return false;
   }
   socket.send(JSON.stringify(message));
+  return true;
 }
 
 function openSocket() {
@@ -287,7 +324,15 @@ function handleServerMessage(message) {
     if (message.errors.length > 0) {
       setStatus(`${message.errors.join(" · ")} — MCU connection retained`, "error");
     }
+  } else if (message.type === "servo_scan") {
+    finishServoScan();
+    if (message.ids.length === 0) {
+      setServoScanResult(`No servos found in IDs ${message.start_id}–${message.end_id}.`);
+    } else {
+      setServoScanResult(`Found ${message.ids.length}: ${message.ids.join(", ")}`, "good");
+    }
   } else if (message.type === "error") {
+    if (servoScanInProgress) finishServoScan();
     connectedToMcu = message.bridge_connected;
     setStatus(
       message.bridge_connected ? `${message.message} — MCU connection retained` : message.message,
@@ -318,5 +363,9 @@ document.addEventListener("DOMContentLoaded", async () => {
     connectMcu();
   });
   document.querySelector("#refresh-positions").addEventListener("click", refreshPositions);
+  document.querySelector("#servo-scan-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    scanServos();
+  });
   openSocket();
 });

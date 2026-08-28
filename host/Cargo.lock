@@ -152,13 +152,20 @@ name = "fetchline-host"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "fetchline-protocol",
+ "futures-util",
  "log",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tower",
 ]
+
+[[package]]
+name = "fetchline-protocol"
+version = "0.1.0"
 
 [[package]]
 name = "form_urlencoded"

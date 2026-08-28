@@ -13,14 +13,14 @@
       <header>
         <p class="eyebrow">FETCHLINE / NETWORK CONTROL</p>
         <h1>STS Servo Control</h1>
-        <p class="lede">Control the servos exposed by your Wi-Fi UART bridge. Settings are shared by the host application for every browser on this network.</p>
+        <p class="lede">Control the servos through the MCU's Wi-Fi controller API. Settings are shared by the host application for every browser on this network.</p>
       </header>
 
       <section class="connection card" aria-labelledby="connection-title">
         <div class="card-heading">
           <div>
             <p class="eyebrow">CONNECTION</p>
-            <h2 id="connection-title">MCU bridge</h2>
+            <h2 id="connection-title">MCU controller</h2>
           </div>
           <p id="connection-status" class="status" role="status">Connecting to local host…</p>
         </div>
@@ -34,6 +34,26 @@
           <button type="submit">Connect &amp; read positions</button>
         </form>
         <p class="hint">The host application is the only TCP client of the MCU. Close virtual-COM software while this panel is in use.</p>
+      </section>
+
+      <section class="servo-scan card" aria-labelledby="servo-scan-title">
+        <div class="card-heading">
+          <div>
+            <p class="eyebrow">BUS DISCOVERY</p>
+            <h2 id="servo-scan-title">Find connected servos</h2>
+          </div>
+          <output id="servo-scan-result" class="scan-result" aria-live="polite">Choose a range to search.</output>
+        </div>
+        <form id="servo-scan-form" class="scan-form">
+          <label>Start ID
+            <input id="servo-scan-start" type="number" min="1" max="253" value="1" required>
+          </label>
+          <label>End ID
+            <input id="servo-scan-end" type="number" min="1" max="253" value="10" required>
+          </label>
+          <button id="servo-scan-button" type="submit">Search MCU bus</button>
+        </form>
+        <p class="hint">The MCU probes each address locally. A full 1–253 search can take up to about 15 seconds.</p>
       </section>
 
       <section id="motor-panel" class="card" aria-labelledby="motor-title"></section>
