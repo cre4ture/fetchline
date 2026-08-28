@@ -36,6 +36,26 @@
         <p class="hint">The host application is the only TCP client of the MCU. Close virtual-COM software while this panel is in use.</p>
       </section>
 
+      <section class="servo-scan card" aria-labelledby="servo-scan-title">
+        <div class="card-heading">
+          <div>
+            <p class="eyebrow">BUS DISCOVERY</p>
+            <h2 id="servo-scan-title">Find connected servos</h2>
+          </div>
+          <output id="servo-scan-result" class="scan-result" aria-live="polite">Choose a range to search.</output>
+        </div>
+        <form id="servo-scan-form" class="scan-form">
+          <label>Start ID
+            <input id="servo-scan-start" type="number" min="1" max="255" value="1" required>
+          </label>
+          <label>End ID
+            <input id="servo-scan-end" type="number" min="1" max="255" value="10" required>
+          </label>
+          <button id="servo-scan-button" type="submit">Search MCU bus</button>
+        </form>
+        <p class="hint">The MCU probes each address locally. A full 1–255 search can take up to about 15 seconds; STS addresses 254 and 255 are reserved and are skipped safely.</p>
+      </section>
+
       <section id="motor-panel" class="card" aria-labelledby="motor-title"></section>
 
       <section class="section-heading">

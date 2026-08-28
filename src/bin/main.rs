@@ -53,16 +53,20 @@ use ssd1306::{I2CDisplayInterface, Ssd1306, prelude::*};
 
 extern crate alloc;
 
-use alloc::format;
+use alloc::{boxed::Box, format};
 use core::cell::Cell;
 
 const TCP_BUFFER_SIZE: usize = 4096;
 const COPY_BUFFER_SIZE: usize = 512;
 const JSON_RPC_BUFFER_SIZE: usize = 1024;
 const MAX_POSITION_BATCH: usize = 6;
+// STS reserves 254 for broadcast and does not permit 255 as a servo address.
+// A full scan can therefore return at most IDs 1 through 253.
+const MAX_SCAN_RESULTS: usize = 253;
 const STS_RESPONSE_TIMEOUT: Duration = Duration::from_millis(50);
 const STS_HEADER: [u8; 2] = [0xff, 0xff];
 const STS_BROADCAST_ID: u8 = 0xfe;
+const STS_INSTRUCTION_PING: u8 = 0x01;
 const STS_INSTRUCTION_READ: u8 = 0x02;
 const STS_INSTRUCTION_WRITE: u8 = 0x03;
 const STS_MODE: u8 = 33;
@@ -200,6 +204,10 @@ struct JsonRpcParams {
     torque_limit: Option<u16>,
     #[serde(default)]
     ids: Option<serde_json_core::heapless::Vec<u8, MAX_POSITION_BATCH>>,
+    #[serde(rename = "startId", default)]
+    start_id: Option<u8>,
+    #[serde(rename = "endId", default)]
+    end_id: Option<u8>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -231,6 +239,10 @@ enum ControllerCommand {
     GetPositions {
         ids: serde_json_core::heapless::Vec<u8, MAX_POSITION_BATCH>,
     },
+    ScanServos {
+        start_id: u8,
+        end_id: u8,
+    },
 }
 
 struct PositionResult {
@@ -255,6 +267,7 @@ enum ControllerResult {
     Accepted,
     Position(PositionResult),
     Positions(serde_json_core::heapless::Vec<PositionResult, MAX_POSITION_BATCH>),
+    Servos(Box<serde_json_core::heapless::Vec<u8, MAX_SCAN_RESULTS>>),
     RawTunnel { active: bool },
 }
 
@@ -278,6 +291,11 @@ impl Serialize for ControllerResult {
             Self::Positions(positions) => {
                 let mut state = serializer.serialize_struct("Positions", 1)?;
                 state.serialize_field("positions", positions)?;
+                state.end()
+            }
+            Self::Servos(ids) => {
+                let mut state = serializer.serialize_struct("Servos", 1)?;
+                state.serialize_field("ids", &**ids)?;
                 state.end()
             }
             Self::RawTunnel { active } if *active => {
@@ -633,6 +651,10 @@ mod services {
             "servo.getPositions" => Ok(ControllerCommand::GetPositions {
                 ids: params.ids.ok_or(RpcFailure::INVALID_PARAMS)?,
             }),
+            "servo.scan" => Ok(ControllerCommand::ScanServos {
+                start_id: params.start_id.ok_or(RpcFailure::INVALID_PARAMS)?,
+                end_id: params.end_id.ok_or(RpcFailure::INVALID_PARAMS)?,
+            }),
             _ => Err(RpcFailure::METHOD_NOT_FOUND),
         }
     }
@@ -690,6 +712,11 @@ mod services {
                     .await
                     .map(ControllerResult::Positions)
             }
+            ControllerCommand::ScanServos { start_id, end_id } => {
+                scan_servos(&mut uart_rx, &mut uart_tx, start_id, end_id)
+                    .await
+                    .map(|ids| ControllerResult::Servos(Box::new(ids)))
+            }
         };
         if result.is_err() {
             warn!("local STS command failed; draining UART before continuing");
@@ -716,6 +743,43 @@ mod services {
                 .map_err(|_| ServoFailure::InvalidArgument)?;
         }
         Ok(positions)
+    }
+
+    #[allow(
+        clippy::large_stack_frames,
+        reason = "a full bus scan retains bounded local STS transaction futures"
+    )]
+    async fn scan_servos(
+        uart_rx: &mut UartRx<'_, Async>,
+        uart_tx: &mut UartTx<'_, Async>,
+        start_id: u8,
+        end_id: u8,
+    ) -> Result<serde_json_core::heapless::Vec<u8, MAX_SCAN_RESULTS>, ServoFailure> {
+        if start_id == 0 || start_id > end_id {
+            return Err(ServoFailure::InvalidArgument);
+        }
+
+        let mut ids = serde_json_core::heapless::Vec::new();
+        for raw_id in u16::from(start_id)..=u16::from(end_id) {
+            let id = raw_id as u8;
+            // Do not transmit an STS read/ping to the broadcast or invalid
+            // addresses, even when a user-selected range includes them.
+            if !is_unicast_servo_id(id) {
+                continue;
+            }
+            match ping_servo(uart_rx, uart_tx, id).await {
+                Ok(()) => ids.push(id).map_err(|_| ServoFailure::InvalidArgument)?,
+                // A timeout is the expected result for an unused address. An
+                // invalid/status reply can be leftover bus data; drain it
+                // before probing the next address.
+                Err(ServoFailure::Transport) => {
+                    resynchronize_uart(uart_rx).await;
+                    return Err(ServoFailure::Transport);
+                }
+                Err(_) => resynchronize_uart(uart_rx).await,
+            }
+        }
+        Ok(ids)
     }
 
     fn encode_success(response: &mut [u8], id: u32, result: &ControllerResult) -> Option<usize> {
@@ -837,6 +901,21 @@ mod services {
         }
         let value = u16::from_le_bytes([status.payload[0], status.payload[1]]);
         Ok(decode_signed_15(value))
+    }
+
+    #[allow(
+        clippy::large_stack_frames,
+        reason = "the local STS ping retains the UART response parser future"
+    )]
+    async fn ping_servo(
+        uart_rx: &mut UartRx<'_, Async>,
+        uart_tx: &mut UartTx<'_, Async>,
+        id: u8,
+    ) -> Result<(), ServoFailure> {
+        validate_servo_id(id)?;
+        send_sts_packet(uart_rx, uart_tx, id, STS_INSTRUCTION_PING, &[])
+            .await
+            .map(|_| ())
     }
 
     #[allow(
@@ -989,11 +1068,15 @@ mod services {
     }
 
     const fn validate_servo_id(id: u8) -> Result<(), ServoFailure> {
-        if id == 0 || id == STS_BROADCAST_ID || id == u8::MAX {
+        if !is_unicast_servo_id(id) {
             Err(ServoFailure::InvalidServoId)
         } else {
             Ok(())
         }
+    }
+
+    const fn is_unicast_servo_id(id: u8) -> bool {
+        id != 0 && id != STS_BROADCAST_ID && id != u8::MAX
     }
 
     const fn checksum(bytes: &[u8]) -> u8 {

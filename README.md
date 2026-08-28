@@ -32,6 +32,10 @@ It controls Feetech **STS/SMS-compatible** servos with the normal STS protocol:
   servos are never read or commanded. Current positions are read when the MCU
   connects and when **Update positions** is pressed. A missing or faulty servo
   is reported individually and does not disconnect the remaining servo controls.
+- **Find connected servos** searches a selectable address range directly on the
+  MCU. It defaults to IDs 1–10 and accepts 1–255; the MCU probes the bus with
+  its local STS deadline and returns every responding ID. Addresses 254 and 255
+  are skipped because they are reserved by STS.
 - The MCU address, IDs, enabled state, and all control limits are stored by
   the Linux host in `~/.config/fetchline-host/config.json` (or
   `$XDG_CONFIG_HOME/fetchline-host/config.json`). Every browser opening the
@@ -89,7 +93,7 @@ Port `3333` exposes [JSON-RPC 2.0](https://www.jsonrpc.org/specification) in
 WebSocket text frames at `ws://<mcu-ip>:3333/rpc`. Requests use numeric
 JSON-RPC IDs; the reply carries the same ID. The API methods are
 `system.ping`, `motor.start`, `motor.stop`, `servo.setPosition`,
-`servo.getPosition`, `servo.getPositions`, `debug.enableRawTunnel`, and
+`servo.getPosition`, `servo.getPositions`, `servo.scan`, `debug.enableRawTunnel`, and
 `debug.disableRawTunnel`. The complete method and parameter reference is in
 [`protocol/README.md`](protocol/README.md).
 

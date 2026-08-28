@@ -15,6 +15,7 @@ instead of ever associating them with a newer servo command.
 | `servo.setPosition` | `id`, `position`, `acceleration`, `torqueLimit` | `{ "accepted": true }` |
 | `servo.getPosition` | `id` | `{ "id": 5, "position": 1625 }` |
 | `servo.getPositions` | `ids` (at most six IDs) | `{ "positions": [...] }` |
+| `servo.scan` | `startId`, `endId` (1–255, inclusive) | `{ "ids": [2, 5, 7] }` |
 | `debug.enableRawTunnel` | none | `{ "port": 3334, "active": true }` |
 | `debug.disableRawTunnel` | none | `{ "active": false }` |
 
@@ -26,3 +27,9 @@ available.
 remains open after a raw client disconnects and accepts a later client again.
 Only `debug.disableRawTunnel` closes it, including any active raw connection.
 Only one raw client is allowed at a time.
+
+`servo.scan` probes every usable STS address in the inclusive range directly
+on the MCU and returns the IDs that replied. The MCU keeps the 50 ms local STS
+deadline for each address, so a full range can take roughly 15 seconds. STS
+addresses `254` (broadcast) and `255` (invalid) are skipped even when they are
+part of the requested 1–255 range; this avoids a broadcast reply collision.

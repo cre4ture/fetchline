@@ -38,6 +38,9 @@ use tokio_tungstenite::{WebSocketStream, client_async, tungstenite::Message as C
 
 const DEFAULT_LISTEN_ADDRESS: &str = "0.0.0.0:8787";
 const SERVO_TIMEOUT: Duration = Duration::from_millis(750);
+// Each unused STS address gets a 50 ms deadline on the MCU. A 1–255 scan also
+// includes UART recovery time, so it needs a longer controller response wait.
+const SERVO_SCAN_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_STALE_CONTROLLER_RESPONSES: usize = 32;
 const STS_HEADER: [u8; 2] = [0xff, 0xff];
 const STS_BROADCAST_ID: u8 = 0xfe;
@@ -218,6 +221,10 @@ enum ClientMessage {
     ReadPositions {
         ids: Vec<u8>,
     },
+    ScanServos {
+        start_id: u8,
+        end_id: u8,
+    },
 }
 
 impl ClientMessage {
@@ -243,6 +250,9 @@ impl ClientMessage {
             ),
             Self::ReadPosition { id } => format!("read position servo={id}"),
             Self::ReadPositions { ids } => format!("read positions servos={ids:?}"),
+            Self::ScanServos { start_id, end_id } => {
+                format!("scan servobus start_id={start_id} end_id={end_id}")
+            }
         }
     }
 }
@@ -271,6 +281,11 @@ enum ServerMessage {
         positions: Vec<Position>,
         errors: Vec<String>,
     },
+    ServoScan {
+        start_id: u8,
+        end_id: u8,
+        ids: Vec<u8>,
+    },
     Error {
         message: String,
         bridge_connected: bool,
@@ -281,6 +296,11 @@ enum ServerMessage {
 struct Position {
     id: u8,
     position: i16,
+}
+
+#[derive(Deserialize)]
+struct ServoScanResult {
+    ids: Vec<u8>,
 }
 
 #[tokio::main]
@@ -460,7 +480,7 @@ fn validate_host_config(config: &HostConfig) -> Result<(), String> {
     if config.endpoint.host.trim().is_empty() || config.endpoint.port == 0 {
         return Err("MCU host and TCP port are required".to_owned());
     }
-    if config.motor.id == 0 || config.motor.id == STS_BROADCAST_ID {
+    if !is_unicast_servo_id(config.motor.id) {
         return Err("motor ID must be between 1 and 253".to_owned());
     }
     if config.motor.speed_percent > 100 {
@@ -470,7 +490,7 @@ fn validate_host_config(config: &HostConfig) -> Result<(), String> {
         return Err("exactly six position servo configurations are required".to_owned());
     }
     for joint in &config.joints {
-        if joint.id == 0 || joint.id == STS_BROADCAST_ID {
+        if !is_unicast_servo_id(joint.id) {
             return Err("servo IDs must be between 1 and 253".to_owned());
         }
         if joint.torque_percent > 100 {
@@ -624,6 +644,9 @@ async fn handle_request(state: &AppState, request: ClientMessage) -> ServerMessa
                     .await
                     .map(|position| ServerMessage::Position { id, position }),
                 ClientMessage::ReadPositions { ids } => read_positions(connection, &ids).await,
+                ClientMessage::ScanServos { start_id, end_id } => {
+                    scan_servos(connection, start_id, end_id).await
+                }
                 ClientMessage::Connect { .. } => unreachable!("connect is handled before locking"),
             };
 
@@ -1004,6 +1027,39 @@ async fn read_positions(
     Ok(ServerMessage::Positions { positions, errors })
 }
 
+async fn scan_servos(
+    connection: &mut BridgeConnection,
+    start_id: u8,
+    end_id: u8,
+) -> Result<ServerMessage, String> {
+    if start_id == 0 || start_id > end_id {
+        return Err("Servo search IDs must be between 1 and 255, with a start no greater than the end".to_owned());
+    }
+    if !connection.is_controller() {
+        return Err("Servo search is available only in JSON-RPC controller mode, not through the raw debug tunnel".to_owned());
+    }
+
+    let response = connection
+        .controller_request_with_timeout(
+            "servo.scan",
+            serde_json::json!({ "startId": start_id, "endId": end_id }),
+            SERVO_SCAN_TIMEOUT,
+        )
+        .await?;
+    let result: ServoScanResult = serde_json::from_value(response)
+        .map_err(|error| format!("MCU returned an invalid servo-scan result: {error}"))?;
+    for &id in &result.ids {
+        if id < start_id || id > end_id || !is_unicast_servo_id(id) {
+            return Err(format!("MCU returned an invalid scanned servo ID {id}"));
+        }
+    }
+    Ok(ServerMessage::ServoScan {
+        start_id,
+        end_id,
+        ids: result.ids,
+    })
+}
+
 /// Controller-mode responses carry a sequence number, so a delayed response
 /// can be discarded safely. Raw debug tunnelling retains the legacy behavior.
 /// Broken TCP I/O is the only case that requires reconnecting.
@@ -1017,11 +1073,15 @@ fn connection_is_usable_after(error: &str) -> bool {
 }
 
 fn validate_id(id: u8) -> Result<(), String> {
-    if id == 0 || id == STS_BROADCAST_ID {
+    if !is_unicast_servo_id(id) {
         Err("Servo ID must be between 1 and 253".to_owned())
     } else {
         Ok(())
     }
+}
+
+fn is_unicast_servo_id(id: u8) -> bool {
+    id != 0 && id != STS_BROADCAST_ID && id != u8::MAX
 }
 
 impl BridgeConnection {
@@ -1039,6 +1099,16 @@ impl BridgeConnection {
     }
 
     async fn controller_request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.controller_request_with_timeout(method, params, SERVO_TIMEOUT)
+            .await
+    }
+
+    async fn controller_request_with_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        response_timeout: Duration,
+    ) -> Result<Value, String> {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
         let request = serde_json::to_string(&serde_json::json!({
@@ -1063,7 +1133,7 @@ impl BridgeConnection {
         .map_err(|error| format!("Could not send a JSON-RPC command to the MCU: {error}"))?;
 
         for _ in 0..MAX_STALE_CONTROLLER_RESPONSES {
-            let message = timeout(SERVO_TIMEOUT, websocket.next())
+            let message = timeout(response_timeout, websocket.next())
                 .await
                 .map_err(|_| "Timed out waiting for an MCU JSON-RPC response".to_owned())?
                 .ok_or_else(|| "MCU closed the JSON-RPC WebSocket".to_owned())?
@@ -1323,6 +1393,7 @@ mod tests {
         assert!(validate_id(253).is_ok());
         assert!(validate_id(0).is_err());
         assert!(validate_id(254).is_err());
+        assert!(validate_id(255).is_err());
     }
 
     #[test]
@@ -1498,6 +1569,45 @@ mod tests {
         move_position(&mut bridge, 5, 1625, 20, 1000)
             .await
             .unwrap();
+        mcu.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn controller_mode_scans_servo_ids_on_the_mcu() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mcu = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            let request = receive_json_rpc_request(&mut websocket).await;
+            assert_eq!(request["method"], "servo.scan");
+            assert_eq!(request["params"]["startId"], 1);
+            assert_eq!(request["params"]["endId"], 10);
+            websocket
+                .send(ControllerMessage::Text(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": { "ids": [2, 5, 7] }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let mut bridge = controller_bridge(address).await;
+        let ServerMessage::ServoScan {
+            start_id,
+            end_id,
+            ids,
+        } = scan_servos(&mut bridge, 1, 10).await.unwrap()
+        else {
+            panic!("servo scan should return a scan response");
+        };
+        assert_eq!((start_id, end_id), (1, 10));
+        assert_eq!(ids, vec![2, 5, 7]);
         mcu.await.unwrap();
     }
 
