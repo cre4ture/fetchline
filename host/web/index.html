@@ -54,6 +54,26 @@
           <button id="servo-scan-button" type="submit">Search MCU bus</button>
         </form>
         <p class="hint">The MCU probes each address locally. A full 1–253 search can take up to about 15 seconds.</p>
+
+        <div class="servo-id-change" aria-labelledby="servo-id-change-title">
+          <div class="card-heading">
+            <div>
+              <p class="eyebrow">SERVO SETUP</p>
+              <h3 id="servo-id-change-title">Change a servo ID</h3>
+            </div>
+            <output id="servo-id-change-result" class="scan-result" aria-live="polite">Enter the current and new ID.</output>
+          </div>
+          <form id="servo-id-change-form" class="scan-form">
+            <label>Current ID
+              <input id="servo-id-current" type="number" min="1" max="253" inputmode="numeric" placeholder="e.g. 5" required>
+            </label>
+            <label>New ID
+              <input id="servo-id-new" type="number" min="1" max="253" inputmode="numeric" placeholder="e.g. 6" required>
+            </label>
+            <button id="servo-id-change-button" type="submit">Change ID</button>
+          </form>
+          <p class="hint">The MCU confirms that the current ID responds and the new ID is unused, then writes the persistent ID setting. Update a matching position-control ID below afterwards, if needed.</p>
+        </div>
       </section>
 
       <section id="motor-panel" class="card" aria-labelledby="motor-title"></section>

@@ -36,6 +36,9 @@ It controls Feetech **STS/SMS-compatible** servos with the normal STS protocol:
   MCU. It defaults to IDs 1–10 and accepts 1–253; the MCU probes the bus with
   its local STS deadline and returns every responding ID. STS address 254 is
   broadcast and 255 is invalid, so neither can be selected.
+- **Change a servo ID** is directly below the scan. The MCU confirms that the
+  current ID responds and the target is unused, writes the STS persistent ID
+  register, and verifies the new ID before reporting success.
 - The MCU address, IDs, enabled state, and all control limits are stored by
   the Linux host in `~/.config/fetchline-host/config.json` (or
   `$XDG_CONFIG_HOME/fetchline-host/config.json`). Every browser opening the
@@ -120,7 +123,8 @@ Port `3333` exposes [JSON-RPC 2.0](https://www.jsonrpc.org/specification) in
 WebSocket text frames at `ws://<mcu-ip>:3333/rpc`. Requests use numeric
 JSON-RPC IDs; the reply carries the same ID. The API methods are
 `system.ping`, `motor.start`, `motor.stop`, `servo.setPosition`,
-`servo.getPosition`, `servo.getPositions`, `servo.scan`, `debug.enableRawTunnel`, and
+`servo.getPosition`, `servo.getPositions`, `servo.scan`, `servo.setId`,
+`debug.enableRawTunnel`, and
 `debug.disableRawTunnel`. The complete method and parameter reference is in
 [`protocol/README.md`](protocol/README.md).
 
