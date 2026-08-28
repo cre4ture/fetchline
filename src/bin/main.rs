@@ -47,7 +47,7 @@ use fetchline::board::{
     SERVO_UART_RX_GPIO, SERVO_UART_TX_GPIO,
 };
 use fetchline_protocol::{CONTROLLER_TCP_PORT, RAW_TUNNEL_TCP_PORT};
-use log::{info, warn};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use ssd1306::{I2CDisplayInterface, Ssd1306, prelude::*};
 
@@ -532,7 +532,7 @@ mod services {
                 Ok(()) => controller_session(&mut socket, uart_rx, uart_tx).await,
                 Err(error) => warn!("rejected controller WebSocket handshake: {error:?}"),
             }
-            socket.abort();
+            release_tcp_socket(&mut socket).await;
         }
     }
 
@@ -559,6 +559,10 @@ mod services {
                     return;
                 }
             };
+            debug!(
+                "controller WebSocket request received bytes={}",
+                request.len()
+            );
             let Some(response_len) =
                 handle_json_rpc(request, &mut response_buffer, uart_rx, uart_tx).await
             else {
@@ -570,6 +574,7 @@ mod services {
                 warn!("could not send JSON-RPC response: {error:?}");
                 return;
             }
+            debug!("controller WebSocket response queued bytes={response_len}");
         }
     }
 
@@ -1146,16 +1151,16 @@ mod services {
             .await
             {
                 Either::First(RawTunnelCommand::Disable) => {
-                    socket.abort();
+                    release_tcp_socket(&mut socket).await;
                     info!("raw UART debug tunnel disabled before a client connected");
                 }
                 Either::First(RawTunnelCommand::Enable) => {
-                    socket.abort();
+                    release_tcp_socket(&mut socket).await;
                 }
                 Either::Second(Ok(())) => {
                     info!("raw UART client connected: {:?}", socket.remote_endpoint());
                     let exit = raw_client_session(&mut socket, uart_rx, uart_tx).await;
-                    socket.abort();
+                    release_tcp_socket(&mut socket).await;
                     match exit {
                         RawClientExit::ClientClosed => {
                             info!("raw UART client disconnected; tunnel remains enabled");
@@ -1170,10 +1175,24 @@ mod services {
                 }
                 Either::Second(Err(error)) => {
                     warn!("raw tunnel TCP accept failed: {error:?}");
-                    socket.abort();
+                    release_tcp_socket(&mut socket).await;
                     Timer::after(Duration::from_secs(1)).await;
                 }
             }
+        }
+    }
+
+    /// Complete the RST send before reusing the stack-owned socket buffers.
+    ///
+    /// `embassy_net::TcpSocket::abort` only queues the reset. Reusing the same
+    /// buffers immediately can leave the TCP listener unavailable after a
+    /// client disconnects, particularly on a lossy Wi-Fi link.
+    async fn release_tcp_socket(socket: &mut TcpSocket<'_>) {
+        socket.abort();
+        match with_timeout(Duration::from_secs(1), socket.flush()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!("could not flush aborted TCP socket: {error:?}"),
+            Err(_) => warn!("timed out flushing aborted TCP socket"),
         }
     }
 
