@@ -21,6 +21,7 @@ header { max-width: 680px; margin-bottom: 2rem; }
 h1, h2, p { margin-top: 0; }
 h1 { margin-bottom: .5rem; font-size: clamp(2.15rem, 5vw, 3.8rem); line-height: .95; letter-spacing: -.055em; }
 h2 { margin-bottom: 0; font-size: 1.15rem; letter-spacing: -.02em; }
+h3 { margin: 0; font-size: 1rem; letter-spacing: -.01em; }
 .lede { color: #b9cbc1; font-size: 1.05rem; }
 .eyebrow { margin-bottom: .4rem; color: #8de2b0; font-size: .71rem; font-weight: 800; letter-spacing: .14em; }
 
@@ -43,6 +44,7 @@ h2 { margin-bottom: 0; font-size: 1.15rem; letter-spacing: -.02em; }
 .scan-result { color: #b9cbc1; font-size: .82rem; text-align: right; }
 .scan-result.good { color: #a9efbd; }
 .scan-result.error { color: #ffb6a8; }
+.servo-id-change { border-top: 1px solid #315044; margin-top: 1.25rem; padding-top: 1.25rem; }
 label { display: grid; gap: .35rem; color: #c4d1c9; font-size: .82rem; font-weight: 650; }
 input { width: 100%; border: 1px solid #547167; border-radius: .5rem; padding: .58rem .65rem; background: #0d1c17; color: #f4fff6; font: inherit; }
 input:focus { outline: 2px solid #82e4a9; outline-offset: 2px; }

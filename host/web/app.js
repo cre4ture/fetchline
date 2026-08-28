@@ -17,6 +17,7 @@ let config = structuredClone(defaults);
 let socket;
 let connectedToMcu = false;
 let servoScanInProgress = false;
+let servoIdChangeInProgress = false;
 const currentPositions = new Map();
 const queuedMoves = new Map();
 const lastSentPositions = new Map();
@@ -267,6 +268,45 @@ function finishServoScan() {
   if (button) button.disabled = false;
 }
 
+function setServoIdChangeResult(text, kind = "") {
+  const result = document.querySelector("#servo-id-change-result");
+  result.textContent = text;
+  result.className = `scan-result ${kind}`;
+}
+
+function finishServoIdChange() {
+  servoIdChangeInProgress = false;
+  const button = document.querySelector("#servo-id-change-button");
+  if (button) button.disabled = false;
+}
+
+function enteredServoId(input) {
+  const id = Number(input.value);
+  return Number.isInteger(id) && id >= 1 && id <= 253 ? id : null;
+}
+
+function changeServoId() {
+  const currentInput = document.querySelector("#servo-id-current");
+  const newInput = document.querySelector("#servo-id-new");
+  const currentId = enteredServoId(currentInput);
+  const newId = enteredServoId(newInput);
+  if (currentId === null || newId === null) {
+    setServoIdChangeResult("Both IDs must be whole numbers from 1 to 253.", "error");
+    return;
+  }
+  if (currentId === newId) {
+    setServoIdChangeResult("The current and new IDs must differ.", "error");
+    return;
+  }
+  if (servoIdChangeInProgress) return;
+  if (!window.confirm(`Change the persistent servo ID from ${currentId} to ${newId}?`)) return;
+
+  servoIdChangeInProgress = true;
+  document.querySelector("#servo-id-change-button").disabled = true;
+  setServoIdChangeResult(`Changing servo ID ${currentId} to ${newId} on the MCU…`);
+  if (!send({ type: "set_servo_id", current_id: currentId, new_id: newId })) finishServoIdChange();
+}
+
 function scanServos() {
   const startInput = document.querySelector("#servo-scan-start");
   const endInput = document.querySelector("#servo-scan-end");
@@ -331,8 +371,15 @@ function handleServerMessage(message) {
     } else {
       setServoScanResult(`Found ${message.ids.length}: ${message.ids.join(", ")}`, "good");
     }
+  } else if (message.type === "servo_id_changed") {
+    finishServoIdChange();
+    setServoIdChangeResult(`Servo ID changed from ${message.previous_id} to ${message.new_id}.`, "good");
   } else if (message.type === "error") {
     if (servoScanInProgress) finishServoScan();
+    if (servoIdChangeInProgress) {
+      finishServoIdChange();
+      setServoIdChangeResult(message.message, "error");
+    }
     connectedToMcu = message.bridge_connected;
     setStatus(
       message.bridge_connected ? `${message.message} — MCU connection retained` : message.message,
@@ -366,6 +413,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   document.querySelector("#servo-scan-form").addEventListener("submit", (event) => {
     event.preventDefault();
     scanServos();
+  });
+  document.querySelector("#servo-id-change-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    changeServoId();
   });
   openSocket();
 });

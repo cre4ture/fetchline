@@ -231,6 +231,10 @@ enum ClientMessage {
         start_id: u8,
         end_id: u8,
     },
+    SetServoId {
+        current_id: u8,
+        new_id: u8,
+    },
 }
 
 impl ClientMessage {
@@ -258,6 +262,9 @@ impl ClientMessage {
             Self::ReadPositions { ids } => format!("read positions servos={ids:?}"),
             Self::ScanServos { start_id, end_id } => {
                 format!("scan servobus start_id={start_id} end_id={end_id}")
+            }
+            Self::SetServoId { current_id, new_id } => {
+                format!("change servo ID current_id={current_id} new_id={new_id}")
             }
         }
     }
@@ -292,6 +299,10 @@ enum ServerMessage {
         end_id: u8,
         ids: Vec<u8>,
     },
+    ServoIdChanged {
+        previous_id: u8,
+        new_id: u8,
+    },
     Error {
         message: String,
         bridge_connected: bool,
@@ -307,6 +318,14 @@ struct Position {
 #[derive(Deserialize)]
 struct ServoScanResult {
     ids: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct ServoIdChangeResult {
+    #[serde(rename = "previousId")]
+    previous_id: u8,
+    #[serde(rename = "newId")]
+    new_id: u8,
 }
 
 #[tokio::main]
@@ -652,6 +671,9 @@ async fn handle_request(state: &AppState, request: ClientMessage) -> ServerMessa
                 ClientMessage::ReadPositions { ids } => read_positions(connection, &ids).await,
                 ClientMessage::ScanServos { start_id, end_id } => {
                     scan_servos(connection, start_id, end_id).await
+                }
+                ClientMessage::SetServoId { current_id, new_id } => {
+                    set_servo_id(connection, current_id, new_id).await
                 }
                 ClientMessage::Connect { .. } => unreachable!("connect is handled before locking"),
             };
@@ -1108,6 +1130,33 @@ async fn scan_servos(
     })
 }
 
+async fn set_servo_id(
+    connection: &mut BridgeConnection,
+    current_id: u8,
+    new_id: u8,
+) -> Result<ServerMessage, String> {
+    validate_id_change(current_id, new_id)?;
+    if !connection.is_controller() {
+        return Err("Changing a servo ID is available only in JSON-RPC controller mode, not through the raw debug tunnel".to_owned());
+    }
+
+    let response = connection
+        .controller_request(
+            "servo.setId",
+            serde_json::json!({ "currentId": current_id, "newId": new_id }),
+        )
+        .await?;
+    let result: ServoIdChangeResult = serde_json::from_value(response)
+        .map_err(|error| format!("MCU returned an invalid servo-ID change result: {error}"))?;
+    if result.previous_id != current_id || result.new_id != new_id {
+        return Err("MCU confirmed different servo IDs than requested".to_owned());
+    }
+    Ok(ServerMessage::ServoIdChanged {
+        previous_id: result.previous_id,
+        new_id: result.new_id,
+    })
+}
+
 /// Controller-mode responses carry a sequence number, so a delayed response
 /// can be discarded safely. Raw debug tunnelling retains the legacy behavior.
 /// Broken TCP I/O is the only case that requires reconnecting.
@@ -1147,6 +1196,16 @@ fn is_unicast_servo_id(id: u8) -> bool {
 fn validate_scan_range(start_id: u8, end_id: u8) -> Result<(), String> {
     if start_id == 0 || start_id > end_id || end_id > MAX_SERVO_ID {
         Err("Servo search IDs must be between 1 and 253, with a start no greater than the end".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_id_change(current_id: u8, new_id: u8) -> Result<(), String> {
+    validate_id(current_id)?;
+    validate_id(new_id)?;
+    if current_id == new_id {
+        Err("The current and new servo IDs must differ".to_owned())
     } else {
         Ok(())
     }
@@ -1474,6 +1533,14 @@ mod tests {
     }
 
     #[test]
+    fn permits_only_safe_servo_id_changes() {
+        assert!(validate_id_change(1, 253).is_ok());
+        assert!(validate_id_change(0, 5).is_err());
+        assert!(validate_id_change(5, 254).is_err());
+        assert!(validate_id_change(5, 5).is_err());
+    }
+
+    #[test]
     fn servo_timeouts_do_not_require_reconnecting_the_bridge() {
         assert!(connection_is_usable_after(
             "Timed out waiting for an STS servo reply"
@@ -1625,6 +1692,23 @@ mod tests {
                 ))
                 .await
                 .unwrap();
+
+            let request = receive_json_rpc_request(&mut websocket).await;
+            assert_eq!(request["method"], "servo.setId");
+            assert_eq!(request["params"]["currentId"], 5);
+            assert_eq!(request["params"]["newId"], 6);
+            websocket
+                .send(ControllerMessage::Text(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": { "previousId": 5, "newId": 6 }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
         });
 
         let (host_address, shutdown, host) = spawn_test_host(AppState::default()).await;
@@ -1663,6 +1747,23 @@ mod tests {
         assert_eq!(response["start_id"], 1);
         assert_eq!(response["end_id"], 10);
         assert_eq!(response["ids"], serde_json::json!([5]));
+
+        browser
+            .send(ControllerMessage::Text(
+                serde_json::json!({
+                    "type": "set_servo_id",
+                    "current_id": 5,
+                    "new_id": 6
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let response = receive_browser_response(&mut browser).await;
+        assert_eq!(response["type"], "servo_id_changed");
+        assert_eq!(response["previous_id"], 5);
+        assert_eq!(response["new_id"], 6);
 
         drop(browser);
         shutdown.send(()).unwrap();
@@ -1775,6 +1876,43 @@ mod tests {
         };
         assert_eq!((start_id, end_id), (1, 10));
         assert_eq!(ids, vec![2, 5, 7]);
+        mcu.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn controller_mode_changes_a_servo_id_on_the_mcu() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mcu = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            let request = receive_json_rpc_request(&mut websocket).await;
+            assert_eq!(request["method"], "servo.setId");
+            assert_eq!(request["params"]["currentId"], 5);
+            assert_eq!(request["params"]["newId"], 6);
+            websocket
+                .send(ControllerMessage::Text(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": { "previousId": 5, "newId": 6 }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let mut bridge = controller_bridge(address).await;
+        let ServerMessage::ServoIdChanged {
+            previous_id,
+            new_id,
+        } = set_servo_id(&mut bridge, 5, 6).await.unwrap()
+        else {
+            panic!("servo ID change should return its old and new IDs");
+        };
+        assert_eq!((previous_id, new_id), (5, 6));
         mcu.await.unwrap();
     }
 

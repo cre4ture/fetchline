@@ -77,6 +77,8 @@ const MAX_SCAN_RESULTS: usize = MAX_SERVO_ID as usize;
 const STS_INSTRUCTION_PING: u8 = 0x01;
 const STS_INSTRUCTION_READ: u8 = 0x02;
 const STS_INSTRUCTION_WRITE: u8 = 0x03;
+// The STS EEPROM register containing the servo's persistent bus ID.
+const STS_SERVO_ID: u8 = 5;
 const STS_MODE: u8 = 33;
 const STS_TORQUE_ENABLE: u8 = 40;
 const STS_ACCELERATION: u8 = 41;
@@ -111,6 +113,7 @@ macro_rules! mk_static {
 enum ServoFailure {
     InvalidServoId,
     InvalidArgument,
+    TargetIdInUse,
     Timeout,
     InvalidReply,
     ReportedError,
@@ -121,6 +124,7 @@ impl ServoFailure {
     const fn rpc_failure(self) -> RpcFailure {
         match self {
             Self::InvalidServoId | Self::InvalidArgument => RpcFailure::INVALID_PARAMS,
+            Self::TargetIdInUse => RpcFailure::SERVO_ID_IN_USE,
             Self::Timeout => RpcFailure::SERVO_TIMEOUT,
             Self::InvalidReply => RpcFailure::SERVO_REPLY,
             Self::ReportedError => RpcFailure::SERVO_REPORTED_ERROR,
@@ -307,6 +311,10 @@ struct JsonRpcParams {
     start_id: Option<u8>,
     #[serde(rename = "endId", default)]
     end_id: Option<u8>,
+    #[serde(rename = "currentId", default)]
+    current_id: Option<u8>,
+    #[serde(rename = "newId", default)]
+    new_id: Option<u8>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -342,11 +350,32 @@ enum ControllerCommand {
         start_id: u8,
         end_id: u8,
     },
+    SetServoId {
+        current_id: u8,
+        new_id: u8,
+    },
 }
 
 struct PositionResult {
     id: u8,
     position: i16,
+}
+
+struct ServoIdResult {
+    previous_id: u8,
+    new_id: u8,
+}
+
+impl Serialize for ServoIdResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("ServoIdResult", 2)?;
+        state.serialize_field("previousId", &self.previous_id)?;
+        state.serialize_field("newId", &self.new_id)?;
+        state.end()
+    }
 }
 
 impl Serialize for PositionResult {
@@ -367,6 +396,7 @@ enum ControllerResult {
     Position(PositionResult),
     Positions(serde_json_core::heapless::Vec<PositionResult, MAX_POSITION_BATCH>),
     Servos(Box<serde_json_core::heapless::Vec<u8, MAX_SCAN_RESULTS>>),
+    ServoId(ServoIdResult),
     RawTunnel { active: bool },
 }
 
@@ -397,6 +427,7 @@ impl Serialize for ControllerResult {
                 state.serialize_field("ids", &**ids)?;
                 state.end()
             }
+            Self::ServoId(result) => result.serialize(serializer),
             Self::RawTunnel { active } if *active => {
                 let mut state = serializer.serialize_struct("RawTunnel", 2)?;
                 state.serialize_field("port", &RAW_TUNNEL_TCP_PORT)?;
@@ -434,6 +465,10 @@ impl RpcFailure {
     const INVALID_PARAMS: Self = Self {
         code: -32602,
         message: "Invalid params",
+    };
+    const SERVO_ID_IN_USE: Self = Self {
+        code: -32005,
+        message: "Target servo ID is already in use",
     };
     const RAW_TUNNEL_ACTIVE: Self = Self {
         code: -32010,
@@ -830,6 +865,10 @@ mod services {
                 start_id: params.start_id.ok_or(RpcFailure::INVALID_PARAMS)?,
                 end_id: params.end_id.ok_or(RpcFailure::INVALID_PARAMS)?,
             }),
+            "servo.setId" => Ok(ControllerCommand::SetServoId {
+                current_id: params.current_id.ok_or(RpcFailure::INVALID_PARAMS)?,
+                new_id: params.new_id.ok_or(RpcFailure::INVALID_PARAMS)?,
+            }),
             _ => Err(RpcFailure::METHOD_NOT_FOUND),
         }
     }
@@ -891,6 +930,16 @@ mod services {
                 scan_servos(&mut uart_rx, &mut uart_tx, start_id, end_id)
                     .await
                     .map(|ids| ControllerResult::Servos(Box::new(ids)))
+            }
+            ControllerCommand::SetServoId { current_id, new_id } => {
+                set_servo_id(&mut uart_rx, &mut uart_tx, current_id, new_id)
+                    .await
+                    .map(|()| {
+                        ControllerResult::ServoId(ServoIdResult {
+                            previous_id: current_id,
+                            new_id,
+                        })
+                    })
             }
         };
         if result.is_err() {
@@ -955,6 +1004,38 @@ mod services {
             }
         }
         Ok(ids)
+    }
+
+    #[allow(
+        clippy::large_stack_frames,
+        reason = "changing a persistent servo ID keeps local STS request and verification futures"
+    )]
+    async fn set_servo_id(
+        uart_rx: &mut UartRx<'_, Async>,
+        uart_tx: &mut UartTx<'_, Async>,
+        current_id: u8,
+        new_id: u8,
+    ) -> Result<(), ServoFailure> {
+        validate_servo_id(current_id)?;
+        validate_servo_id(new_id)?;
+        if current_id == new_id {
+            return Err(ServoFailure::InvalidArgument);
+        }
+
+        // Do not change an address unless the selected servo is actually
+        // present and the destination address is unused. A timeout on the
+        // destination is expected; every other error leaves the bus untouched.
+        ping_servo(uart_rx, uart_tx, current_id).await?;
+        match ping_servo(uart_rx, uart_tx, new_id).await {
+            Ok(()) => return Err(ServoFailure::TargetIdInUse),
+            Err(ServoFailure::Timeout) => resynchronize_uart(uart_rx).await,
+            Err(error) => return Err(error),
+        }
+
+        write_servo_id(uart_rx, uart_tx, current_id, new_id).await?;
+        // The ID register is persistent. Verify the new address before
+        // reporting success so the host never assumes an unconfirmed change.
+        ping_servo(uart_rx, uart_tx, new_id).await
     }
 
     fn encode_success(response: &mut [u8], id: u32, result: &ControllerResult) -> Option<usize> {
@@ -1125,6 +1206,36 @@ mod services {
         }
     }
 
+    /// Changes the persistent STS ID register. Depending on firmware timing,
+    /// the write acknowledgement may use either the old or the new ID, so
+    /// accept both and verify the new address separately afterwards.
+    #[allow(
+        clippy::large_stack_frames,
+        reason = "the ID-register write retains the UART transaction future"
+    )]
+    async fn write_servo_id(
+        uart_rx: &mut UartRx<'_, Async>,
+        uart_tx: &mut UartTx<'_, Async>,
+        current_id: u8,
+        new_id: u8,
+    ) -> Result<(), ServoFailure> {
+        let expected_ids = [current_id, new_id];
+        let status = send_sts_packet_accepting_status_ids(
+            uart_rx,
+            uart_tx,
+            current_id,
+            STS_INSTRUCTION_WRITE,
+            &[STS_SERVO_ID, new_id],
+            &expected_ids,
+        )
+        .await?;
+        if status.payload_len == 0 {
+            Ok(())
+        } else {
+            Err(ServoFailure::InvalidReply)
+        }
+    }
+
     struct StsStatus {
         payload: [u8; 64],
         payload_len: usize,
@@ -1141,6 +1252,22 @@ mod services {
         instruction: u8,
         parameters: &[u8],
     ) -> Result<StsStatus, ServoFailure> {
+        send_sts_packet_accepting_status_ids(uart_rx, uart_tx, id, instruction, parameters, &[id])
+            .await
+    }
+
+    #[allow(
+        clippy::large_stack_frames,
+        reason = "the local STS transaction retains UART I/O and timeout futures"
+    )]
+    async fn send_sts_packet_accepting_status_ids(
+        uart_rx: &mut UartRx<'_, Async>,
+        uart_tx: &mut UartTx<'_, Async>,
+        id: u8,
+        instruction: u8,
+        parameters: &[u8],
+        expected_status_ids: &[u8],
+    ) -> Result<StsStatus, ServoFailure> {
         let mut packet = [0_u8; 16];
         let packet_len = controller_protocol::encode_instruction_packet(
             &mut packet,
@@ -1154,7 +1281,12 @@ mod services {
             .await
             .map_err(|_| ServoFailure::Transport)?;
 
-        match with_timeout(STS_RESPONSE_TIMEOUT, read_sts_status(uart_rx, id)).await {
+        match with_timeout(
+            STS_RESPONSE_TIMEOUT,
+            read_sts_status(uart_rx, expected_status_ids),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_) => Err(ServoFailure::Timeout),
         }
@@ -1166,7 +1298,7 @@ mod services {
     )]
     async fn read_sts_status(
         uart_rx: &mut UartRx<'_, Async>,
-        expected_id: u8,
+        expected_ids: &[u8],
     ) -> Result<StsStatus, ServoFailure> {
         let mut previous = 0_u8;
         let mut found_header = false;
@@ -1191,7 +1323,11 @@ mod services {
         for byte in &mut packet[2..length + 2] {
             *byte = read_uart_byte(uart_rx).await?;
         }
-        let status = controller_protocol::decode_status_packet(&packet[..length + 2], expected_id)
+        let response_id = packet[0];
+        if !expected_ids.contains(&response_id) {
+            return Err(ServoFailure::InvalidReply);
+        }
+        let status = controller_protocol::decode_status_packet(&packet[..length + 2], response_id)
             .map_err(|_| ServoFailure::InvalidReply)?;
         if status.error != 0 {
             return Err(ServoFailure::ReportedError);

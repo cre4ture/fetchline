@@ -29,6 +29,7 @@ available instead of exposing a reconnect race to the control UI.
 | `servo.getPosition` | `id` | `{ "id": 5, "position": 1625 }` |
 | `servo.getPositions` | `ids` (at most six IDs) | `{ "positions": [...] }` |
 | `servo.scan` | `startId`, `endId` (1–253, inclusive) | `{ "ids": [2, 5, 7] }` |
+| `servo.setId` | `currentId`, `newId` (distinct IDs from 1–253) | `{ "previousId": 5, "newId": 6 }` |
 | `debug.enableRawTunnel` | none | `{ "port": 3334, "active": true }` |
 | `debug.disableRawTunnel` | none | `{ "active": false }` |
 
@@ -46,3 +47,9 @@ the MCU and returns the IDs that replied. The MCU keeps the 50 ms local STS
 deadline for each address, so a full range can take roughly 15 seconds. Address
 `254` is the STS broadcast address and `255` is invalid, so the API rejects
 both rather than risking a broadcast reply collision.
+
+`servo.setId` first PINGs `currentId`, then makes sure `newId` does not answer.
+It writes the STS persistent ID register and PINGs `newId` to confirm the
+change. If the target already answers, the command returns JSON-RPC server
+error `-32005` and does not write to the bus. A successful ID change does not
+change the host's configured position-control IDs automatically.
