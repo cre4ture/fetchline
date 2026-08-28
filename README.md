@@ -176,6 +176,20 @@ Feetech lists the FE-URT-2 as a Type-C USB-to-TTL/RS485 programmer with a UART
 header. Its supported range reaches 1 Mbps; see the
 [official Feetech debugging-board listing](https://www.feetechrc.com/serial-port-series-steering-gear_50681).
 
+### Direct FE-URT-2 USB scan
+
+With the FE-URT-2 connected directly by USB (and the ESP32 UART wires
+disconnected), scan the bus without moving or reconfiguring any servo:
+
+```sh
+python3 scripts/scan-sts-servos.py \
+  --device /dev/serial/by-id/usb-1a86_USB_Single_Serial_<serial>-if00
+```
+
+The scanner uses per-ID STS PING packets at 1,000,000 baud, 8N1. It requires
+an explicit device path, accepts a 1–253 range through `--start-id` and
+`--end-id`, and never sends a broadcast packet or a register write.
+
 ## Prerequisites
 
 Install Rust with [rustup](https://rustup.rs/), then install the Espressif
