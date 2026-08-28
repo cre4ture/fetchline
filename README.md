@@ -83,16 +83,23 @@ Packet payloads are intentionally not logged. This avoids filling the log
 during live slider movement while retaining the IDs, actions, errors, and timing
 needed to distinguish a host/MCU network failure from a servo-bus failure.
 
-The MCU keeps two fixed controller TCP slots so a new connection can replace a
-peer that disappeared without a clean TCP close. Only the newest successfully
-upgraded WebSocket session may execute controller commands; it closes the
-previous session. The host has no authentication: every device that can reach
-the MCU can therefore take over physical actuators. Keep it on a trusted LAN,
-or firewall the port / use a VPN.
+The MCU reserves three TCP transport sockets so that one continues listening
+while a new connection replaces the current session. Only the newest
+successfully upgraded WebSocket session may execute controller commands; it
+closes every previous session. The extra sockets are transport capacity, not
+additional controller authority: exactly one session owns the STS bus. The host
+has no authentication: every device that can reach the MCU can therefore take
+over physical actuators. Keep it on a trusted LAN, or firewall the port / use a
+VPN.
+
+Takeovers are serialized until a retiring socket has returned to listening
+mode. This prevents a burst of reconnects from leaving every transport socket
+busy flushing a prior TCP reset. The host retries the brief transport transition
+automatically before reporting a connection failure.
 
 ## Testing
 
-`just check` runs the firmware release build and lint, eight native tests for
+`just check` runs the firmware release build and lint, ten native tests for
 the production STS packet parser/encoder and controller-ownership epoch, and
 the host test suite. The host suite includes an end-to-end WebSocket test that
 drives a browser request through the host into a simulated MCU controller API.

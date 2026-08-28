@@ -115,6 +115,69 @@ impl ControllerEpoch {
     }
 }
 
+/// Serializes controller ownership changes until the retiring TCP transport is
+/// listening again.  It permits exactly one active controller generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ControllerAdmission {
+    epoch: ControllerEpoch,
+    active: bool,
+    listener_required: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControllerAdmissionResult {
+    Granted {
+        generation: u64,
+        replaces_active: bool,
+    },
+    WaitForListener,
+}
+
+impl ControllerAdmission {
+    pub const fn new() -> Self {
+        Self {
+            epoch: ControllerEpoch::new(),
+            active: false,
+            listener_required: false,
+        }
+    }
+
+    /// Grants the next session only when no predecessor is still returning its
+    /// TCP transport to listening mode.
+    pub fn try_claim(&mut self) -> ControllerAdmissionResult {
+        if self.listener_required {
+            return ControllerAdmissionResult::WaitForListener;
+        }
+
+        let replaces_active = self.active;
+        let generation = self.epoch.claim();
+        self.active = true;
+        self.listener_required = replaces_active;
+        ControllerAdmissionResult::Granted {
+            generation,
+            replaces_active,
+        }
+    }
+
+    /// Marks the current session as no longer active after a normal disconnect.
+    pub fn release(&mut self, generation: u64) {
+        if self.epoch.is_current(generation) {
+            self.active = false;
+        }
+    }
+
+    /// Returns true when this listener transition unblocks a queued takeover.
+    pub fn listener_ready(&mut self) -> bool {
+        let required = self.listener_required;
+        self.listener_required = false;
+        required
+    }
+
+    pub const fn is_current(self, generation: u64) -> bool {
+        self.epoch.is_current(generation)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +255,63 @@ mod tests {
         let second = epoch.claim();
         assert!(!epoch.is_current(first));
         assert!(epoch.is_current(second));
+    }
+
+    #[test]
+    fn serializes_takeovers_until_a_listener_returns() {
+        let mut admission = ControllerAdmission::new();
+        let ControllerAdmissionResult::Granted {
+            generation: first,
+            replaces_active,
+        } = admission.try_claim()
+        else {
+            panic!("the first controller must be admitted");
+        };
+        assert!(!replaces_active);
+
+        let ControllerAdmissionResult::Granted {
+            generation: second,
+            replaces_active,
+        } = admission.try_claim()
+        else {
+            panic!("the second controller must replace the first");
+        };
+        assert!(replaces_active);
+        assert!(!admission.is_current(first));
+        assert!(admission.is_current(second));
+        assert_eq!(
+            admission.try_claim(),
+            ControllerAdmissionResult::WaitForListener
+        );
+
+        assert!(admission.listener_ready());
+        let ControllerAdmissionResult::Granted {
+            generation: third,
+            replaces_active,
+        } = admission.try_claim()
+        else {
+            panic!("a listener return must admit the waiting controller");
+        };
+        assert!(replaces_active);
+        assert!(admission.is_current(third));
+    }
+
+    #[test]
+    fn normal_disconnect_does_not_block_the_next_controller() {
+        let mut admission = ControllerAdmission::new();
+        let ControllerAdmissionResult::Granted {
+            generation: first, ..
+        } = admission.try_claim()
+        else {
+            panic!("the first controller must be admitted");
+        };
+        admission.release(first);
+        let ControllerAdmissionResult::Granted {
+            replaces_active, ..
+        } = admission.try_claim()
+        else {
+            panic!("a disconnected controller must not block a replacement");
+        };
+        assert!(!replaces_active);
     }
 }

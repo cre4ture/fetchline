@@ -60,9 +60,11 @@ use alloc::{boxed::Box, format};
 use core::cell::Cell;
 
 const TCP_BUFFER_SIZE: usize = 4096;
-// One active controller session and one standby listener let a replacement
-// connection take over even if the previous TCP peer disappeared silently.
-const CONTROLLER_SOCKET_SLOTS: usize = 2;
+// `TcpSocket::accept` consumes the listening socket for the newly connected
+// client. Three transport sockets therefore preserve one listener throughout a
+// handover: current session, newly accepted replacement, and standby listener.
+// Only the latest WebSocket generation may issue an STS command.
+const CONTROLLER_TRANSPORT_SLOTS: usize = 3;
 const CONTROLLER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const COPY_BUFFER_SIZE: usize = 512;
 const JSON_RPC_BUFFER_SIZE: usize = 1024;
@@ -186,32 +188,85 @@ static RAW_TUNNEL: RawTunnelControl = RawTunnelControl::new();
 
 /// Tracks the controller session that is currently allowed to issue commands.
 ///
-/// Two TCP sockets can be established at once, but the STS bus must still have
+/// Transport sockets may overlap while handing over, but the STS bus has
 /// exactly one owner. A newly upgraded WebSocket claims the next generation;
-/// the previous generation is notified and closes its session before accepting
-/// another controller command.
+/// the previous generation is notified and closes its session before another
+/// command can run.
 struct ControllerOwnership {
-    current: BlockingMutex<CriticalSectionRawMutex, Cell<controller_protocol::ControllerEpoch>>,
-    changes: Watch<CriticalSectionRawMutex, u64, CONTROLLER_SOCKET_SLOTS>,
+    current: BlockingMutex<CriticalSectionRawMutex, Cell<controller_protocol::ControllerAdmission>>,
+    changes: Watch<CriticalSectionRawMutex, u64, CONTROLLER_TRANSPORT_SLOTS>,
+    listener_changes: Watch<CriticalSectionRawMutex, u64, CONTROLLER_TRANSPORT_SLOTS>,
+    listener_change: BlockingMutex<CriticalSectionRawMutex, Cell<u64>>,
 }
 
 impl ControllerOwnership {
     const fn new() -> Self {
         Self {
-            current: BlockingMutex::new(Cell::new(controller_protocol::ControllerEpoch::new())),
+            current: BlockingMutex::new(Cell::new(controller_protocol::ControllerAdmission::new())),
             changes: Watch::new(),
+            listener_changes: Watch::new(),
+            listener_change: BlockingMutex::new(Cell::new(0)),
         }
     }
 
-    fn claim(&self) -> u64 {
-        let generation = self.current.lock(|current| {
-            let mut epoch = current.get();
-            let generation = epoch.claim();
-            current.set(epoch);
-            generation
+    async fn claim(&self) -> u64 {
+        let mut listener_changes = self
+            .listener_changes
+            .receiver()
+            .expect("listener update receivers match controller transport sockets");
+        loop {
+            let generation = self.current.lock(|current| {
+                let mut admission = current.get();
+                let result = admission.try_claim();
+                current.set(admission);
+                match result {
+                    controller_protocol::ControllerAdmissionResult::Granted {
+                        generation,
+                        replaces_active,
+                    } => Some((generation, replaces_active)),
+                    controller_protocol::ControllerAdmissionResult::WaitForListener => None,
+                }
+            });
+            if let Some((generation, replaces_active)) = generation {
+                self.changes.sender().send(generation);
+                if replaces_active {
+                    info!(
+                        "controller generation {generation} is replacing the active session; admission is held until its transport listens again"
+                    );
+                }
+                return generation;
+            }
+
+            info!(
+                "controller connection is waiting for a transport socket to return to listening mode"
+            );
+            listener_changes.changed().await;
+        }
+    }
+
+    fn release(&self, generation: u64) {
+        self.current.lock(|current| {
+            let mut admission = current.get();
+            admission.release(generation);
+            current.set(admission);
         });
-        self.changes.sender().send(generation);
-        generation
+    }
+
+    fn listener_ready(&self) {
+        let unblocked = self.current.lock(|current| {
+            let mut admission = current.get();
+            let unblocked = admission.listener_ready();
+            current.set(admission);
+            unblocked
+        });
+        if unblocked {
+            let change = self.listener_change.lock(|change| {
+                let next_change = change.get().wrapping_add(1);
+                change.set(next_change);
+                next_change
+            });
+            self.listener_changes.sender().send(change);
+        }
     }
 
     fn is_current(&self, generation: u64) -> bool {
@@ -503,7 +558,9 @@ async fn main(spawner: Spawner) -> ! {
     let (stack, runner) = embassy_net::new(
         interfaces.station,
         network_config,
-        mk_static!(StackResources<4>, StackResources::<4>::new()),
+        // DHCP, the raw-debug socket, and the three controller transport
+        // sockets need five stack socket entries in total.
+        mk_static!(StackResources<5>, StackResources::<5>::new()),
         seed,
     );
 
@@ -531,6 +588,10 @@ async fn main(spawner: Spawner) -> ! {
             .expect("failed to allocate replacement JSON-RPC controller task"),
     );
     spawner.spawn(
+        services::controller_service(stack, uart_rx, uart_tx)
+            .expect("failed to allocate standby JSON-RPC controller task"),
+    );
+    spawner.spawn(
         services::raw_tunnel_service(stack, uart_rx, uart_tx)
             .expect("failed to allocate raw tunnel task"),
     );
@@ -547,7 +608,7 @@ async fn main(spawner: Spawner) -> ! {
 mod services {
     use super::*;
 
-    #[embassy_executor::task(pool_size = 2)]
+    #[embassy_executor::task(pool_size = CONTROLLER_TRANSPORT_SLOTS)]
     #[allow(
         clippy::large_stack_frames,
         reason = "the JSON-RPC service keeps one WebSocket and its TCP buffers for its task lifetime"
@@ -567,6 +628,7 @@ mod services {
             socket.set_timeout(Some(Duration::from_secs(30)));
 
             info!("waiting for JSON-RPC WebSocket client on port {CONTROLLER_TCP_PORT}");
+            CONTROLLER_OWNERSHIP.listener_ready();
             if let Err(error) = socket.accept(CONTROLLER_TCP_PORT).await {
                 warn!("controller TCP accept failed: {error:?}");
                 Timer::after(Duration::from_secs(1)).await;
@@ -583,11 +645,12 @@ mod services {
             .await
             {
                 Ok(Ok(())) => {
-                    let generation = CONTROLLER_OWNERSHIP.claim();
+                    let generation = CONTROLLER_OWNERSHIP.claim().await;
                     info!(
                         "controller WebSocket session claimed generation {generation}; newest session owns the STS bus"
                     );
                     controller_session(&mut socket, uart_rx, uart_tx, generation).await;
+                    CONTROLLER_OWNERSHIP.release(generation);
                 }
                 Ok(Err(error)) => warn!("rejected controller WebSocket handshake: {error:?}"),
                 Err(_) => warn!("timed out upgrading controller WebSocket"),
@@ -611,7 +674,7 @@ mod services {
         let mut ownership_updates = CONTROLLER_OWNERSHIP
             .changes
             .receiver()
-            .expect("controller ownership receiver slots match TCP socket slots");
+            .expect("controller ownership receiver slots match controller transport sockets");
         let announced_generation = ownership_updates.get().await;
         if announced_generation != generation {
             info!(
@@ -652,10 +715,22 @@ mod services {
                 "controller WebSocket request received bytes={}",
                 request.len()
             );
-            let Some(response_len) =
-                handle_json_rpc(request, &mut response_buffer, uart_rx, uart_tx).await
-            else {
-                continue;
+            let response_len = match select(
+                handle_json_rpc(request, &mut response_buffer, uart_rx, uart_tx),
+                ownership_updates.changed(),
+            )
+            .await
+            {
+                Either::First(Some(response_len)) => response_len,
+                Either::First(None) => continue,
+                Either::Second(newer_generation) => {
+                    info!(
+                        "controller WebSocket generation {generation} replaced by generation {newer_generation} while a command was running"
+                    );
+                    let mut uart_rx = uart_rx.lock().await;
+                    resynchronize_uart(&mut uart_rx).await;
+                    return;
+                }
             };
             if !CONTROLLER_OWNERSHIP.is_current(generation) {
                 info!(
@@ -1131,11 +1206,20 @@ mod services {
 
     async fn read_uart_byte(uart_rx: &mut UartRx<'_, Async>) -> Result<u8, ServoFailure> {
         let mut byte = [0_u8; 1];
-        uart_rx
-            .read_async(&mut byte)
-            .await
-            .map_err(|_| ServoFailure::Transport)?;
-        Ok(byte[0])
+        loop {
+            match uart_rx.read_async(&mut byte).await {
+                Ok(1) => return Ok(byte[0]),
+                // `read_async` is allowed to return fewer bytes than the
+                // supplied buffer. An empty result cannot satisfy this helper,
+                // so wait for the next RX event instead.
+                Ok(_) => continue,
+                // The FE-URT-2 link can raise a transient UART RX event while
+                // the actual STS status frame is still arriving. The raw
+                // debug tunnel already retries such events; do the same here
+                // and let the enclosing 50 ms STS deadline decide failure.
+                Err(error) => debug!("ignoring transient servo UART RX event: {error:?}"),
+            }
+        }
     }
 
     async fn resynchronize_uart(uart_rx: &mut UartRx<'_, Async>) {

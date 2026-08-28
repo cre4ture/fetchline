@@ -9,11 +9,16 @@ instead of ever associating them with a newer servo command.
 
 ## Controller connection policy
 
-The MCU has two fixed TCP/WebSocket controller slots. This permits a newly
-connected host to take over even if the previous peer vanished without a clean
-TCP close. Once its WebSocket upgrade succeeds, the newest session becomes the
-only session allowed to execute controller commands; the prior session is
-closed. At most one STS command is executed at a time.
+The MCU reserves three TCP/WebSocket transport slots. One remains listening
+while a newly connected host takes over, even if a prior peer vanished without
+a clean TCP close. Once its WebSocket upgrade succeeds, the newest session
+becomes the only session allowed to execute controller commands; prior sessions
+are closed. The extra transport slots do not add controller authority: at most
+one STS command is executed at a time.
+
+The MCU serializes takeovers until a retiring socket is listening again, and
+the host retries this short TCP transition automatically. This keeps a listener
+available instead of exposing a reconnect race to the control UI.
 
 | Method | Named parameters | Result |
 | --- | --- | --- |

@@ -101,6 +101,15 @@ def main() -> int:
                 raise RuntimeError("the first controller session remained open after takeover")
         finally:
             second.close()
+
+        # The second session has just ended without a WebSocket close frame.
+        # A current session and a releasing older session must not consume all
+        # transport listeners: the next client must still upgrade immediately.
+        third = open_websocket(arguments.host, arguments.port)
+        try:
+            ping(third, 3)
+        finally:
+            third.close()
     finally:
         first.close()
 

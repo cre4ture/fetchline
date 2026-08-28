@@ -38,6 +38,11 @@ use tokio_tungstenite::{WebSocketStream, client_async, tungstenite::Message as C
 
 const DEFAULT_LISTEN_ADDRESS: &str = "0.0.0.0:8787";
 const SERVO_TIMEOUT: Duration = Duration::from_millis(750);
+// A newly accepted controller connection makes the MCU abort the prior
+// session. Allow a short retry window while its TCP reset is flushed and the
+// released transport socket returns to listening mode.
+const CONTROLLER_CONNECT_RETRY_WINDOW: Duration = Duration::from_secs(3);
+const CONTROLLER_CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 // Each unused STS address gets a 50 ms deadline on the MCU. A 1–253 scan also
 // includes UART recovery time, so it needs a longer controller response wait.
 const SERVO_SCAN_TIMEOUT: Duration = Duration::from_secs(20);
@@ -787,6 +792,26 @@ async fn connect(state: &AppState, host: String, port: u16) -> ServerMessage {
 }
 
 async fn connect_controller(peer: &str) -> Result<WebSocketStream<TcpStream>, String> {
+    let started = Instant::now();
+    loop {
+        match connect_controller_once(peer).await {
+            Ok(websocket) => return Ok(websocket),
+            Err(error)
+                if controller_connection_is_retryable(&error)
+                    && started.elapsed() < CONTROLLER_CONNECT_RETRY_WINDOW =>
+            {
+                log::debug!(
+                    "retrying controller connection peer={peer} elapsed_ms={} error={error}",
+                    started.elapsed().as_millis()
+                );
+                sleep(CONTROLLER_CONNECT_RETRY_INTERVAL).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn connect_controller_once(peer: &str) -> Result<WebSocketStream<TcpStream>, String> {
     let stream = timeout(SERVO_TIMEOUT, TcpStream::connect(peer))
         .await
         .map_err(|_| format!("Timed out connecting to {peer}"))?
@@ -800,6 +825,13 @@ async fn connect_controller(peer: &str) -> Result<WebSocketStream<TcpStream>, St
         .map_err(|_| format!("Timed out opening the JSON-RPC WebSocket to {peer}"))?
         .map(|(websocket, _)| websocket)
         .map_err(|error| format!("Could not open the JSON-RPC WebSocket to {peer}: {error}"))
+}
+
+fn controller_connection_is_retryable(error: &str) -> bool {
+    error.starts_with("Timed out connecting")
+        || error.starts_with("Could not connect")
+        || error.starts_with("Timed out opening the JSON-RPC WebSocket")
+        || error.starts_with("Could not open the JSON-RPC WebSocket")
 }
 
 async fn connect_raw_tunnel(peer: &str) -> Result<TcpStream, String> {
@@ -1995,6 +2027,45 @@ mod tests {
             connect(&state, "127.0.0.1".to_owned(), port).await,
             ServerMessage::Connected { .. }
         ));
+        assert!(matches!(
+            connect(&state, "127.0.0.1".to_owned(), port).await,
+            ServerMessage::Connected { .. }
+        ));
+        controller.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnecting_waits_for_a_controller_listener_returning_after_handover() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = AppState::default();
+        let controller = tokio::spawn(async move {
+            // The first TCP connection simulates an MCU socket that has
+            // accepted a replacement but has not completed its WebSocket
+            // handover yet. The host must retry instead of surfacing this
+            // transient state to the browser.
+            let (first, _) = listener.accept().await.unwrap();
+            sleep(SERVO_TIMEOUT + CONTROLLER_CONNECT_RETRY_INTERVAL).await;
+            drop(first);
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            let request = receive_json_rpc_request(&mut websocket).await;
+            assert_eq!(request["method"], "system.ping");
+            websocket
+                .send(ControllerMessage::Text(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": request["id"],
+                        "result": { "ready": true }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
         assert!(matches!(
             connect(&state, "127.0.0.1".to_owned(), port).await,
             ServerMessage::Connected { .. }
